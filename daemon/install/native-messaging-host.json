@@ -1,0 +1,7 @@
+{
+	"name": "com.vbm.daemon",
+	"description": "Vector Bookmark native daemon bridge",
+	"path": "BINARY_PATH",
+	"type": "stdio",
+	"allowed_origins": ["chrome-extension://EXTENSION_ID/"]
+}

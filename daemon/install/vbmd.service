@@ -1,0 +1,18 @@
+[Unit]
+Description=Vector Bookmark Daemon
+After=network.target
+Documentation=https://github.com/vbm/vector-bookmark
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vbmd server
+Restart=on-failure
+RestartSec=3s
+# Restrict to loopback — daemon enforces this itself too
+PrivateNetwork=false
+# Standard output goes to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

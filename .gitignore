@@ -1,0 +1,24 @@
+# Go
+daemon/bin/
+daemon/vendor/
+
+# Node / extension
+extension/node_modules/
+extension/dist/
+
+# SQLite DB and runtime
+*.db
+*.db-wal
+*.db-shm
+
+# Session file (contains auth token)
+session.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
