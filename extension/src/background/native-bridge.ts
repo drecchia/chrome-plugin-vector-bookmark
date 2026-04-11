@@ -50,6 +50,13 @@ export async function connectDaemon(): Promise<void> {
 	});
 }
 
+// P2-09: reset cached state so next call to connectDaemon() re-runs the handshake.
+// Called when the daemon returns 401 (token rotated after restart).
+export function resetDaemon(): void {
+	daemonState.port = null;
+	daemonState.token = null;
+}
+
 export function getDaemonBase(): string {
 	return `http://127.0.0.1:${daemonState.port}`;
 }

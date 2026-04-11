@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -69,6 +70,9 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	// P2-08: metrics counters — no external dependency, plain Prometheus text format.
+	m := &serverMetrics{}
+
 	// Healthz — no auth, but checks DB connectivity (P1-04).
 	r.Get("/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -79,6 +83,9 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 		}
 		w.Write([]byte(`{"ok":true}`))
 	})
+
+	// P2-08: /metrics in Prometheus text format — no auth required for scraping.
+	r.Get("/metrics", m.handler(s))
 
 	// Auth-protected routes
 	r.Group(func(r chi.Router) {
@@ -91,14 +98,20 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 				return
 			}
-			q.Enqueue(store.IngestRequest{
+			ireq := store.IngestRequest{
 				URL:     ir.URL,
 				Title:   ir.Title,
 				Text:    ir.Text,
 				VisitTs: ir.VisitTs,
 				DwellMs: ir.DwellMs,
 				Domain:  ir.Domain,
-			})
+			}
+			q.Enqueue(ireq)
+			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
+			if err := s.AddQueueItem(ireq); err != nil {
+				log.Printf("[ingest] queue persist error for %s: %v", ir.URL, err)
+			}
+			m.ingestTotal.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			w.Write([]byte(`{"queued":true}`))
@@ -125,6 +138,7 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 				http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
 				return
 			}
+			m.searchTotal.Add(1)
 			type searchResultJSON struct {
 				URL     string  `json:"url"`
 				Title   string  `json:"title"`
@@ -162,6 +176,7 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 				http.Error(w, `{"error":"forget failed"}`, http.StatusInternalServerError)
 				return
 			}
+			m.forgetTotal.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"forgotten":true}`))
 		})
@@ -210,6 +225,8 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 				return
 			}
 			defer conn.Close()
+			m.wsActive.Add(1)
+			defer m.wsActive.Add(-1)
 
 			const readDeadline = 60 * time.Second
 			const writeDeadline = 10 * time.Second
@@ -265,13 +282,15 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 			}
 		})
 
+		// P2-01: inject actual session token so the embedded UI search form works.
+		uiWithToken := strings.ReplaceAll(uiHTML, "REPLACE_TOKEN", token)
 		r.Get("/ui", func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(uiHTML))
+			w.Write([]byte(uiWithToken))
 		})
 		r.Get("/ui/*", func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(uiHTML))
+			w.Write([]byte(uiWithToken))
 		})
 	})
 

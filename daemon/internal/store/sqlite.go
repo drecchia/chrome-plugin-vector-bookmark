@@ -114,6 +114,8 @@ func New(dataDir string, e embed.Embedder) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// P2-03: SQLite is single-writer — make the pool constraint explicit.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("wal mode: %w", err)
@@ -407,9 +409,10 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 		if !ok {
 			continue
 		}
+		// P2-05: 400 chars gives better context for technical docs.
 		snippet := rd.text
-		if len(snippet) > 200 {
-			snippet = snippet[:200]
+		if len(snippet) > 400 {
+			snippet = snippet[:400]
 		}
 		results = append(results, SearchResult{
 			URL:     rd.url,
@@ -536,6 +539,30 @@ type ExportPage struct {
 	VisitTs int64         `json:"visitTs"`
 	DwellMs int64         `json:"dwellMs"`
 	Chunks  []ExportChunk `json:"chunks"`
+}
+
+// AddQueueItem persists an ingest request in the queue table with status='pending'.
+// P2-02: makes pending count in GetStatus() accurate and enables cleanup.
+func (s *Store) AddQueueItem(req IngestRequest) error {
+	now := time.Now().UnixMilli()
+	_, err := s.db.Exec(`
+		INSERT INTO queue (url, title, text, visit_ts, dwell_ms, domain, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+	`, req.URL, req.Title, req.Text, req.VisitTs, req.DwellMs, req.Domain, now)
+	if err != nil {
+		return fmt.Errorf("add queue item: %w", err)
+	}
+	return nil
+}
+
+// RemoveQueueItem deletes all pending queue rows for a given URL after successful ingest.
+// P2-02: prevents the queue table from accumulating processed entries indefinitely.
+func (s *Store) RemoveQueueItem(url string) error {
+	_, err := s.db.Exec(`DELETE FROM queue WHERE url = ? AND status = 'pending'`, url)
+	if err != nil {
+		return fmt.Errorf("remove queue item: %w", err)
+	}
+	return nil
 }
 
 // Export returns all indexed pages with their chunks for LGPD portability.

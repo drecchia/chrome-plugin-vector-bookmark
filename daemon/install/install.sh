@@ -3,6 +3,19 @@ set -e
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
+# P2-06: prerequisite checks before doing anything.
+if [ -n "$1" ] && [ "$1" != "$HOME/.local/bin/vbmd" ]; then
+  if [ ! -f "$1" ]; then
+    echo "ERROR: binary not found at '$1'" >&2
+    exit 1
+  fi
+elif [ ! -f "$HOME/.local/bin/vbmd" ]; then
+  echo "ERROR: vbmd binary not found at \$HOME/.local/bin/vbmd" >&2
+  echo "  Build it first: cd daemon && make build && cp bin/vbmd \$HOME/.local/bin/vbmd" >&2
+  echo "  Or pass the binary path as first argument: bash install.sh /path/to/vbmd" >&2
+  exit 1
+fi
+
 # Determine binary path
 BINARY="${1:-$HOME/.local/bin/vbmd}"
 

@@ -47,6 +47,11 @@ func (q *Queue) worker() {
 	for req := range q.ch {
 		if err := q.store.Ingest(req); err != nil {
 			log.Printf("[queue] ingest error for %s: %v", req.URL, err)
+			continue
+		}
+		// P2-02: remove from persistent queue after successful ingest.
+		if err := q.store.RemoveQueueItem(req.URL); err != nil {
+			log.Printf("[queue] remove queue item error for %s: %v", req.URL, err)
 		}
 	}
 }

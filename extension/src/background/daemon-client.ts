@@ -5,7 +5,12 @@ import {
 	type StatusResponse,
 	type ForgetRequest,
 } from '../../../proto/types';
-import { connectDaemon, getDaemonBase, getAuthHeader } from './native-bridge';
+import {
+	connectDaemon,
+	getDaemonBase,
+	getAuthHeader,
+	resetDaemon,
+} from './native-bridge';
 
 function authHeaders(): Record<string, string> {
 	return {
@@ -16,6 +21,10 @@ function authHeaders(): Record<string, string> {
 }
 
 async function checkResponse(res: Response): Promise<void> {
+	if (res.status === 401) {
+		// P2-09: daemon restarted — token rotated. Force re-handshake on next call.
+		resetDaemon();
+	}
 	if (!res.ok) {
 		throw new Error(`Daemon HTTP error ${res.status}: ${res.statusText}`);
 	}

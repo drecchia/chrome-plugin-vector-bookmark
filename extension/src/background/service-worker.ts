@@ -18,6 +18,41 @@ interface PageViewedMessage {
 // P1-01: capture state lives in the service worker (survives popup open/close).
 let captureEnabled = true;
 
+// P2-04: debounce omnibox to avoid a fetch on every keystroke.
+let omniboxTimer: ReturnType<typeof setTimeout> | null = null;
+
+// P2-10: strip common tracking/session query params before indexing.
+function sanitizeUrl(url: string): string {
+	try {
+		const u = new URL(url);
+		const trackingParams = [
+			'utm_source',
+			'utm_medium',
+			'utm_campaign',
+			'utm_term',
+			'utm_content',
+			'fbclid',
+			'gclid',
+			'msclkid',
+			'ref',
+			'source',
+			'token',
+			'access_token',
+			'api_key',
+			'key',
+			'secret',
+			'session',
+			'sid',
+			'sessionid',
+			'session_id',
+		];
+		for (const p of trackingParams) u.searchParams.delete(p);
+		return u.toString();
+	} catch {
+		return url;
+	}
+}
+
 function escapeXml(s: string): string {
 	return s
 		.replace(/&/g, '&amp;')
@@ -49,13 +84,15 @@ async function handlePageViewed(
 		return;
 	}
 
+	// P2-10: strip tracking/session params from URL before indexing.
+	const cleanUrl = sanitizeUrl(msg.url);
 	await ingest({
-		url: msg.url,
+		url: cleanUrl,
 		title: msg.title,
 		text: msg.text,
 		visitTs: Date.now(),
 		dwellMs: msg.dwellMs,
-		domain: new URL(msg.url).hostname,
+		domain: new URL(cleanUrl).hostname,
 	});
 
 	// Update badge briefly
@@ -114,22 +151,27 @@ chrome.runtime.onMessage.addListener(
 );
 
 chrome.omnibox.onInputChanged.addListener(
-	async (
+	(
 		text: string,
 		suggest: (suggestions: chrome.omnibox.SuggestResult[]) => void,
 	) => {
 		if (text.length < 2) return;
-		try {
-			const results = await search(text, 5);
-			suggest(
-				results.map((r) => ({
-					content: r.url,
-					description: `<url>${escapeXml(r.domain)}</url> — <match>${escapeXml(r.snippet.slice(0, 80))}</match>`,
-				})),
-			);
-		} catch {
-			// daemon not connected — silently skip
-		}
+		// P2-04: debounce — wait 200ms after last keystroke before fetching.
+		if (omniboxTimer !== null) clearTimeout(omniboxTimer);
+		omniboxTimer = setTimeout(async () => {
+			omniboxTimer = null;
+			try {
+				const results = await search(text, 5);
+				suggest(
+					results.map((r) => ({
+						content: r.url,
+						description: `<url>${escapeXml(r.domain)}</url> — <match>${escapeXml(r.snippet.slice(0, 80))}</match>`,
+					})),
+				);
+			} catch {
+				// daemon not connected — silently skip
+			}
+		}, 200);
 	},
 );
 
