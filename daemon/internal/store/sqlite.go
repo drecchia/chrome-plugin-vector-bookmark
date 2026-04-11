@@ -185,18 +185,21 @@ func (s *Store) Ingest(req IngestRequest) error {
 		}
 		blob := embed.EncodeEmbedding(vec)
 
-		_, err = tx.Exec(`
+		// P0-03: use RowsAffected to detect new vs duplicate chunk.
+		res, err := tx.Exec(`
 			INSERT OR IGNORE INTO chunks (page_id, chunk_idx, text, text_hash, embedding, model_ver)
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, pageID, c.Index, c.Text, c.Hash, blob, s.embedder.Version())
 		if err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.Index, err)
 		}
-	}
-
-	// Rebuild FTS index
-	if _, err := tx.Exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`); err != nil {
-		return fmt.Errorf("fts rebuild: %w", err)
+		// Update FTS incrementally — only for newly inserted chunks.
+		if n, _ := res.RowsAffected(); n > 0 {
+			chunkID, _ := res.LastInsertId()
+			if _, err := tx.Exec(`INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)`, chunkID, c.Text); err != nil {
+				return fmt.Errorf("fts insert chunk %d: %w", c.Index, err)
+			}
+		}
 	}
 
 	return tx.Commit()
@@ -247,47 +250,59 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 		}
 	}
 
-	// Step 2: Dense search
+	// Step 2: Dense search — skipped when embedder is stub (all-zero vectors).
 	queryVec, err := s.embedder.Embed(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 
-	type scoredChunk struct {
-		id     int64
-		text   string
-		pageID int64
-		score  float32
-	}
-
-	allRows, err := s.db.Query(`SELECT id, text, page_id, embedding FROM chunks`)
-	if err != nil {
-		return nil, fmt.Errorf("load chunks: %w", err)
-	}
-	defer allRows.Close()
-
-	var scored []scoredChunk
-	for allRows.Next() {
-		var id, pageID int64
-		var text string
-		var blob []byte
-		if err := allRows.Scan(&id, &text, &pageID, &blob); err != nil {
-			continue
-		}
-		vec := embed.DecodeEmbedding(blob)
-		sim := embed.CosineSimilarity(queryVec, vec)
-		scored = append(scored, scoredChunk{id: id, text: text, pageID: pageID, score: sim})
-	}
-	allRows.Close()
-
-	sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
 	denseRanks := map[int64]int{}
-	cap50 := 50
-	for i, sc := range scored {
-		if i >= cap50 {
+
+	// P0-05: detect stub/zero query vector to avoid O(N) full scan.
+	isStub := true
+	for _, v := range queryVec {
+		if v != 0 {
+			isStub = false
 			break
 		}
-		denseRanks[sc.id] = i
+	}
+
+	if !isStub {
+		type scoredChunk struct {
+			id     int64
+			text   string
+			pageID int64
+			score  float32
+		}
+
+		allRows, err := s.db.Query(`SELECT id, text, page_id, embedding FROM chunks`)
+		if err != nil {
+			return nil, fmt.Errorf("load chunks: %w", err)
+		}
+		defer allRows.Close()
+
+		var scored []scoredChunk
+		for allRows.Next() {
+			var id, pageID int64
+			var text string
+			var blob []byte
+			if err := allRows.Scan(&id, &text, &pageID, &blob); err != nil {
+				continue
+			}
+			vec := embed.DecodeEmbedding(blob)
+			sim := embed.CosineSimilarity(queryVec, vec)
+			scored = append(scored, scoredChunk{id: id, text: text, pageID: pageID, score: sim})
+		}
+		allRows.Close()
+
+		sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+		cap50 := 50
+		for i, sc := range scored {
+			if i >= cap50 {
+				break
+			}
+			denseRanks[sc.id] = i
+		}
 	}
 
 	// Step 3: RRF fusion
@@ -378,6 +393,26 @@ func (s *Store) Forget(req ForgetRequest) error {
 	}
 	_, err = s.db.Exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
 	return err
+}
+
+// Cleanup deletes pages (and their chunks via CASCADE) older than ttlDays days.
+// Returns the number of pages deleted. ttlDays <= 0 is a no-op.
+func (s *Store) Cleanup(ttlDays int) (int64, error) {
+	if ttlDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -ttlDays).UnixMilli()
+	res, err := s.db.Exec(`DELETE FROM pages WHERE visit_ts < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if _, err := s.db.Exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`); err != nil {
+			return n, fmt.Errorf("cleanup fts rebuild: %w", err)
+		}
+	}
+	return n, nil
 }
 
 // GetStatus returns the number of indexed pages and pending queue items.

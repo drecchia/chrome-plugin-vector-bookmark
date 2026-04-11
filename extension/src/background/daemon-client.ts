@@ -1,33 +1,11 @@
+import {
+	type IngestRequest,
+	type SearchResult,
+	type SearchResponse,
+	type StatusResponse,
+	type ForgetRequest,
+} from '../../../proto/types';
 import { connectDaemon, getDaemonBase, getAuthHeader } from './native-bridge';
-
-interface IngestRequest {
-	url: string;
-	title: string;
-	text: string;
-	visitTs: number;
-	dwellMs: number;
-	domain: string;
-}
-
-interface SearchResult {
-	url: string;
-	title: string;
-	snippet: string;
-	visitTs: number;
-	score: number;
-	domain: string;
-}
-
-interface StatusResponse {
-	indexed: number;
-	pending: number;
-	version: string;
-}
-
-interface ForgetRequest {
-	type: 'url' | 'domain' | 'timerange';
-	value: string;
-}
 
 function authHeaders(): Record<string, string> {
 	return {
@@ -64,7 +42,9 @@ export async function search(
 		headers: authHeaders(),
 	});
 	await checkResponse(res);
-	return res.json() as Promise<SearchResult[]>;
+	// P0-01: daemon returns {results: SearchResult[], total: number}
+	const data = (await res.json()) as SearchResponse;
+	return data.results;
 }
 
 export async function forget(req: ForgetRequest): Promise<void> {
