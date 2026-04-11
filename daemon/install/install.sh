@@ -31,6 +31,18 @@ echo "4. Copy the extension ID shown"
 echo ""
 read -p "Extension ID (leave blank to set later): " EXTENSION_ID
 
+# Validate extension ID: Chrome extension IDs are exactly 32 lowercase letters a-p
+if [ -n "$EXTENSION_ID" ]; then
+  if ! echo "$EXTENSION_ID" | grep -qE '^[a-p]{32}$'; then
+    echo ""
+    echo "WARNING: '$EXTENSION_ID' does not look like a valid Chrome extension ID."
+    echo "  Expected: 32 lowercase letters (a-p). Example: abcdefghijklmnopabcdefghijklmnop"
+    echo "  The NM manifest will be installed but may not work until the ID is corrected."
+    echo "  Re-run: EXTENSION_ID=<correct_id> bash $0"
+    echo ""
+  fi
+fi
+
 # Install NM manifest for Chrome
 CHROME_NM_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
 mkdir -p "$CHROME_NM_DIR"

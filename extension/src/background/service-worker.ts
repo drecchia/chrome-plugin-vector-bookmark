@@ -1,4 +1,5 @@
 import { ingest, search, getStatus, forget } from './daemon-client';
+import { daemonState } from './native-bridge';
 import { isDeniedUrl, isDeniedDomain } from '../lib/denylist';
 
 interface ForgetRequest {
@@ -14,6 +15,9 @@ interface PageViewedMessage {
 	dwellMs: number;
 }
 
+// P1-01: capture state lives in the service worker (survives popup open/close).
+let captureEnabled = true;
+
 function escapeXml(s: string): string {
 	return s
 		.replace(/&/g, '&amp;')
@@ -26,6 +30,9 @@ async function handlePageViewed(
 	msg: PageViewedMessage,
 	sender: chrome.runtime.MessageSender,
 ): Promise<void> {
+	// P1-01: respect pause state.
+	if (!captureEnabled) return;
+
 	if (!sender.tab) return;
 	const url = msg.url;
 	if (
@@ -62,7 +69,7 @@ async function handlePageViewed(
 
 chrome.runtime.onMessage.addListener(
 	(
-		msg: { type: string; req?: ForgetRequest },
+		msg: { type: string; req?: ForgetRequest; enabled?: boolean },
 		sender: chrome.runtime.MessageSender,
 		sendResponse: (response?: unknown) => void,
 	) => {
@@ -78,8 +85,22 @@ chrome.runtime.onMessage.addListener(
 
 		if (msg.type === 'popup_status') {
 			getStatus()
-				.then(sendResponse)
+				.then((status) =>
+					// P1-02: include daemon port so popup can build correct UI URL.
+					sendResponse({
+						...status,
+						daemonPort: daemonState.port,
+						captureEnabled,
+					}),
+				)
 				.catch((e) => sendResponse({ error: String(e) }));
+			return true;
+		}
+
+		// P1-01: popup toggles capture on/off.
+		if (msg.type === 'popup_set_capture') {
+			captureEnabled = msg.enabled ?? true;
+			sendResponse({ ok: true, captureEnabled });
 			return true;
 		}
 

@@ -28,13 +28,21 @@ type Session struct {
 }
 
 // SessionPath returns the path to the session file.
-func SessionPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "vbm", "session.json")
+// Returns an error if the home directory cannot be determined.
+func SessionPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	return filepath.Join(home, ".local", "share", "vbm", "session.json"), nil
 }
 
 func readSession() (*Session, error) {
-	data, err := os.ReadFile(SessionPath())
+	path, err := SessionPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +52,10 @@ func readSession() (*Session, error) {
 
 // WriteSession writes the session file (chmod 600).
 func WriteSession(s *Session) error {
-	path := SessionPath()
+	path, err := SessionPath()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,7 +72,9 @@ func Run() error {
 	if err := nm.WriteSession(&nm.Session{Port: port, Token: token}); err != nil {
 		return fmt.Errorf("write session: %w", err)
 	}
-	defer os.Remove(nm.SessionPath())
+	if sessionPath, err := nm.SessionPath(); err == nil {
+		defer os.Remove(sessionPath)
+	}
 
 	log.Printf("[vbmd] server listening on %s", listener.Addr().String())
 
@@ -98,7 +101,17 @@ func Run() error {
 		}
 	}
 
-	r := newRouter(s, q, token, version)
+	// P1-07: allow external origins via VBM_CORS_ORIGIN (comma-separated).
+	var extraOrigins []string
+	if co := os.Getenv("VBM_CORS_ORIGIN"); co != "" {
+		for _, o := range strings.Split(co, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				extraOrigins = append(extraOrigins, o)
+			}
+		}
+	}
+
+	r := newRouter(s, q, token, version, extraOrigins)
 
 	srv := &http.Server{Handler: r}
 

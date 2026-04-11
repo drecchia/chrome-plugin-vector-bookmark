@@ -7,6 +7,7 @@ export const DENY_DOMAINS: string[] = [
 	'login.microsoftonline.com',
 	'outlook.live.com',
 	'onedrive.live.com',
+	// US banks
 	'bankofamerica.com',
 	'chase.com',
 	'wellsfargo.com',
@@ -14,15 +15,32 @@ export const DENY_DOMAINS: string[] = [
 	'venmo.com',
 	'coinbase.com',
 	'kraken.com',
+	// Password managers
 	'1password.com',
 	'bitwarden.com',
 	'lastpass.com',
 	'dashlane.com',
 	'keepass.info',
+	// US government (specific domains; TLDs covered below)
 	'healthcare.gov',
 	'medicaid.gov',
 	'irs.gov',
 	'ssa.gov',
+	// Brazilian banks and financial institutions (P1-09)
+	'itau.com.br',
+	'bradesco.com.br',
+	'bradesconetempresa.b.br',
+	'nubank.com.br',
+	'santander.com.br',
+	'bb.com.br',
+	'caixa.gov.br',
+	'bancobrasil.com.br',
+	'inter.co',
+	'bancointer.com.br',
+	'sicoob.com.br',
+	'sicredi.com.br',
+	'safra.com.br',
+	'btgpactual.com',
 ];
 
 export const DENY_URL_PATTERNS: RegExp[] = [
@@ -42,10 +60,11 @@ export const DENY_URL_PATTERNS: RegExp[] = [
 ];
 
 export function isDeniedDomain(hostname: string): boolean {
-	// .gov TLD
+	// .gov / .mil TLDs (US and BR)
 	if (hostname.endsWith('.gov') || hostname === 'gov') return true;
-	// .mil TLD
 	if (hostname.endsWith('.mil') || hostname === 'mil') return true;
+	if (hostname.endsWith('.gov.br')) return true;
+	if (hostname.endsWith('.mil.br')) return true;
 
 	for (const denied of DENY_DOMAINS) {
 		// Exact match

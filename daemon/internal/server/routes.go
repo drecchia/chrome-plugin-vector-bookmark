@@ -62,21 +62,28 @@ document.getElementById('search').onsubmit = async e => {
 </body>
 </html>`
 
-func newRouter(s *store.Store, q *queue.Queue, token, ver string) http.Handler {
+// newRouter builds the HTTP router. extraOrigins are additional CORS-allowed origins
+// beyond chrome-extension:// (e.g. a local dashboard, configured via VBM_CORS_ORIGIN).
+func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins []string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Healthz — no auth
+	// Healthz — no auth, but checks DB connectivity (P1-04).
 	r.Get("/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if err := s.Ping(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"ok":false,"error":"database unavailable"}`))
+			return
+		}
 		w.Write([]byte(`{"ok":true}`))
 	})
 
 	// Auth-protected routes
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware(token))
-		r.Use(corsMiddleware)
+		r.Use(corsMiddleware(extraOrigins))
 
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
 			var ir ingestRequest
@@ -128,8 +135,9 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string) http.Handler {
 			}
 			type searchResponse struct {
 				Results []searchResultJSON `json:"results"`
+				Total   int                `json:"total"`
 			}
-			resp := searchResponse{Results: make([]searchResultJSON, 0, len(results))}
+			resp := searchResponse{Results: make([]searchResultJSON, 0, len(results)), Total: len(results)}
 			for _, res := range results {
 				resp.Results = append(resp.Results, searchResultJSON{
 					URL:     res.URL,
@@ -177,6 +185,25 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string) http.Handler {
 			})
 		})
 
+		// P1-15: export endpoint for LGPD portability.
+		r.Get("/export", func(w http.ResponseWriter, req *http.Request) {
+			pages, err := s.Export()
+			if err != nil {
+				http.Error(w, `{"error":"export failed"}`, http.StatusInternalServerError)
+				return
+			}
+			type exportResponse struct {
+				Pages []store.ExportPage `json:"pages"`
+				Total int                `json:"total"`
+			}
+			if pages == nil {
+				pages = []store.ExportPage{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(exportResponse{Pages: pages, Total: len(pages)})
+		})
+
+		// P1-10: WebSocket with ping/pong and write deadlines.
 		r.Get("/ws", func(w http.ResponseWriter, req *http.Request) {
 			conn, err := upgrader.Upgrade(w, req, nil)
 			if err != nil {
@@ -184,12 +211,37 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string) http.Handler {
 			}
 			defer conn.Close()
 
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
+			const readDeadline = 60 * time.Second
+			const writeDeadline = 10 * time.Second
+			const pingInterval = 30 * time.Second
+
+			conn.SetReadDeadline(time.Now().Add(readDeadline))
+			conn.SetPongHandler(func(string) error {
+				conn.SetReadDeadline(time.Now().Add(readDeadline))
+				return nil
+			})
+
+			// Read goroutine required by gorilla/websocket to process control frames.
+			readDone := make(chan struct{})
+			go func() {
+				defer close(readDone)
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+				}
+			}()
+
+			statusTicker := time.NewTicker(5 * time.Second)
+			pingTicker := time.NewTicker(pingInterval)
+			defer statusTicker.Stop()
+			defer pingTicker.Stop()
 
 			for {
 				select {
-				case <-ticker.C:
+				case <-readDone:
+					return
+				case <-statusTicker.C:
 					indexed, pending, err := s.GetStatus()
 					if err != nil {
 						return
@@ -199,8 +251,14 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string) http.Handler {
 						Indexed int    `json:"indexed"`
 						Pending int    `json:"pending"`
 					}
+					conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 					msg := wsStatus{Type: "status", Indexed: indexed, Pending: pending}
 					if err := conn.WriteJSON(msg); err != nil {
+						return
+					}
+				case <-pingTicker.C:
+					conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 						return
 					}
 				}
@@ -249,18 +307,28 @@ func authMiddleware(token string) func(http.Handler) http.Handler {
 	}
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if strings.HasPrefix(origin, "chrome-extension://") {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+// corsMiddleware sets CORS headers for chrome-extension:// origins and any extraOrigins.
+// P1-07: extraOrigins allows external dashboards (e.g. VBM_CORS_ORIGIN=http://localhost:3000).
+func corsMiddleware(extraOrigins []string) func(http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(extraOrigins))
+	for _, o := range extraOrigins {
+		if o != "" {
+			allowed[o] = true
 		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if strings.HasPrefix(origin, "chrome-extension://") || allowed[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

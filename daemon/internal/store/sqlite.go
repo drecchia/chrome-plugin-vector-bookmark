@@ -59,7 +59,8 @@ type ForgetRequest struct {
 	Value string // URL, domain name, or "fromMs:toMs"
 }
 
-const schema = `
+// schemaV1 is the initial database schema (migration version 1).
+const schemaV1 = `
 CREATE TABLE IF NOT EXISTS pages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     url TEXT NOT NULL,
@@ -128,9 +129,44 @@ func New(dataDir string, e embed.Embedder) (*Store, error) {
 	return &Store{db: db, embedder: e}, nil
 }
 
+// migrate applies all pending schema migrations in order.
+// Schema versions are tracked in the schema_versions table.
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(schema)
-	return err
+	// Bootstrap version tracking table (always safe — IF NOT EXISTS).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_versions (
+		version    INTEGER PRIMARY KEY,
+		applied_at INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create schema_versions: %w", err)
+	}
+
+	var current int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_versions`).Scan(&current); err != nil {
+		return fmt.Errorf("get schema version: %w", err)
+	}
+
+	migrations := []struct {
+		version int
+		sql     string
+	}{
+		{1, schemaV1},
+	}
+
+	for _, m := range migrations {
+		if m.version <= current {
+			continue
+		}
+		if _, err := db.Exec(m.sql); err != nil {
+			return fmt.Errorf("migrate to v%d: %w", m.version, err)
+		}
+		if _, err := db.Exec(
+			`INSERT INTO schema_versions (version, applied_at) VALUES (?, ?)`,
+			m.version, time.Now().UnixMilli(),
+		); err != nil {
+			return fmt.Errorf("record migration v%d: %w", m.version, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the database.
@@ -324,32 +360,64 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 		entries = entries[:limit]
 	}
 
-	// Step 4: Build results
+	// Step 4: Build results — single JOIN query instead of N+1.
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	scoreByID := make(map[int64]float64, len(entries))
+	ids := make([]any, len(entries))
+	for i, e := range entries {
+		ids[i] = e.id
+		scoreByID[e.id] = e.score
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	joinQuery := fmt.Sprintf(`
+		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts
+		FROM chunks c JOIN pages p ON c.page_id = p.id
+		WHERE c.id IN (%s)
+	`, placeholders)
+	joinRows, err := s.db.Query(joinQuery, ids...)
+	if err != nil {
+		return nil, fmt.Errorf("build results: %w", err)
+	}
+	defer joinRows.Close()
+
+	// Collect into map to preserve RRF order after JOIN.
+	type rowData struct {
+		text    string
+		url     string
+		title   string
+		domain  string
+		visitTs int64
+	}
+	rowMap := make(map[int64]rowData, len(entries))
+	for joinRows.Next() {
+		var id int64
+		var rd rowData
+		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs); err != nil {
+			continue
+		}
+		rowMap[id] = rd
+	}
+
 	results := make([]SearchResult, 0, len(entries))
 	for _, e := range entries {
-		var text string
-		var pageID int64
-		row := s.db.QueryRow(`SELECT text, page_id FROM chunks WHERE id = ?`, e.id)
-		if err := row.Scan(&text, &pageID); err != nil {
+		rd, ok := rowMap[e.id]
+		if !ok {
 			continue
 		}
-		var url, title, domain string
-		var visitTs int64
-		prow := s.db.QueryRow(`SELECT url, title, domain, visit_ts FROM pages WHERE id = ?`, pageID)
-		if err := prow.Scan(&url, &title, &domain, &visitTs); err != nil {
-			continue
-		}
-		snippet := text
+		snippet := rd.text
 		if len(snippet) > 200 {
 			snippet = snippet[:200]
 		}
 		results = append(results, SearchResult{
-			URL:     url,
-			Title:   title,
+			URL:     rd.url,
+			Title:   rd.title,
 			Snippet: snippet,
-			VisitTs: visitTs,
+			VisitTs: rd.visitTs,
 			Score:   e.score,
-			Domain:  domain,
+			Domain:  rd.domain,
 		})
 	}
 	return results, nil
@@ -367,13 +435,29 @@ func rrf(bm25Ranks, denseRanks map[int64]int, k int) map[int64]float64 {
 }
 
 // Forget deletes pages (and cascades to chunks) based on type.
+// Also cleans matching rows from the queue table (P1-03).
 func (s *Store) Forget(req ForgetRequest) error {
-	var err error
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("forget tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	switch req.Type {
 	case "url":
-		_, err = s.db.Exec(`DELETE FROM pages WHERE url = ?`, req.Value)
+		if _, err = tx.Exec(`DELETE FROM pages WHERE url = ?`, req.Value); err != nil {
+			return fmt.Errorf("forget pages url: %w", err)
+		}
+		if _, err = tx.Exec(`DELETE FROM queue WHERE url = ?`, req.Value); err != nil {
+			return fmt.Errorf("forget queue url: %w", err)
+		}
 	case "domain":
-		_, err = s.db.Exec(`DELETE FROM pages WHERE domain = ?`, req.Value)
+		if _, err = tx.Exec(`DELETE FROM pages WHERE domain = ?`, req.Value); err != nil {
+			return fmt.Errorf("forget pages domain: %w", err)
+		}
+		if _, err = tx.Exec(`DELETE FROM queue WHERE domain = ?`, req.Value); err != nil {
+			return fmt.Errorf("forget queue domain: %w", err)
+		}
 	case "timerange":
 		parts := strings.SplitN(req.Value, ":", 2)
 		if len(parts) != 2 {
@@ -384,12 +468,18 @@ func (s *Store) Forget(req ForgetRequest) error {
 		if err1 != nil || err2 != nil {
 			return fmt.Errorf("invalid timerange numbers: %q", req.Value)
 		}
-		_, err = s.db.Exec(`DELETE FROM pages WHERE visit_ts >= ? AND visit_ts <= ?`, fromMs, toMs)
+		if _, err = tx.Exec(`DELETE FROM pages WHERE visit_ts >= ? AND visit_ts <= ?`, fromMs, toMs); err != nil {
+			return fmt.Errorf("forget pages timerange: %w", err)
+		}
+		if _, err = tx.Exec(`DELETE FROM queue WHERE visit_ts >= ? AND visit_ts <= ?`, fromMs, toMs); err != nil {
+			return fmt.Errorf("forget queue timerange: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown forget type: %q", req.Type)
 	}
-	if err != nil {
-		return err
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("forget commit: %w", err)
 	}
 	_, err = s.db.Exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
 	return err
@@ -424,4 +514,77 @@ func (s *Store) GetStatus() (indexed int, pending int, err error) {
 	row = s.db.QueryRow(`SELECT COUNT(*) FROM queue WHERE status = 'pending'`)
 	err = row.Scan(&pending)
 	return
+}
+
+// Ping verifies the database connection is alive and readable.
+func (s *Store) Ping() error {
+	var n int
+	return s.db.QueryRow(`SELECT 1`).Scan(&n)
+}
+
+// ExportChunk holds a single chunk for export.
+type ExportChunk struct {
+	ChunkIdx int    `json:"chunkIdx"`
+	Text     string `json:"text"`
+}
+
+// ExportPage holds a page and all its chunks for export.
+type ExportPage struct {
+	URL     string        `json:"url"`
+	Title   string        `json:"title"`
+	Domain  string        `json:"domain"`
+	VisitTs int64         `json:"visitTs"`
+	DwellMs int64         `json:"dwellMs"`
+	Chunks  []ExportChunk `json:"chunks"`
+}
+
+// Export returns all indexed pages with their chunks for LGPD portability.
+func (s *Store) Export() ([]ExportPage, error) {
+	rows, err := s.db.Query(`
+		SELECT p.id, p.url, p.title, p.domain, p.visit_ts, p.dwell_ms,
+		       c.chunk_idx, c.text
+		FROM pages p
+		LEFT JOIN chunks c ON c.page_id = p.id
+		ORDER BY p.visit_ts DESC, c.chunk_idx ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("export query: %w", err)
+	}
+	defer rows.Close()
+
+	pageMap := make(map[int64]*ExportPage)
+	var order []int64 // preserve visit_ts DESC order
+	for rows.Next() {
+		var pageID int64
+		var url, title, domain string
+		var visitTs, dwellMs int64
+		var chunkIdx sql.NullInt64
+		var chunkText sql.NullString
+		if err := rows.Scan(&pageID, &url, &title, &domain, &visitTs, &dwellMs, &chunkIdx, &chunkText); err != nil {
+			continue
+		}
+		if _, seen := pageMap[pageID]; !seen {
+			pageMap[pageID] = &ExportPage{
+				URL:     url,
+				Title:   title,
+				Domain:  domain,
+				VisitTs: visitTs,
+				DwellMs: dwellMs,
+				Chunks:  []ExportChunk{},
+			}
+			order = append(order, pageID)
+		}
+		if chunkIdx.Valid && chunkText.Valid {
+			pageMap[pageID].Chunks = append(pageMap[pageID].Chunks, ExportChunk{
+				ChunkIdx: int(chunkIdx.Int64),
+				Text:     chunkText.String,
+			})
+		}
+	}
+
+	result := make([]ExportPage, 0, len(order))
+	for _, id := range order {
+		result = append(result, *pageMap[id])
+	}
+	return result, nil
 }

@@ -4,6 +4,8 @@ interface StatusResponse {
 	indexed: number;
 	pending: number;
 	version: string;
+	daemonPort: number | null;
+	captureEnabled: boolean;
 }
 
 interface ForgetRequest {
@@ -14,7 +16,6 @@ interface ForgetRequest {
 export default function App() {
 	const [status, setStatus] = useState<StatusResponse | null>(null);
 	const [error, setError] = useState<string | null>(null);
-	const [paused, setPaused] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [forgetValue, setForgetValue] = useState('');
 	const [forgetType, setForgetType] = useState<'url' | 'domain'>('url');
@@ -35,6 +36,21 @@ export default function App() {
 		});
 	}, []);
 
+	// P1-01: send pause/resume to service worker.
+	function handleToggleCapture() {
+		const nextEnabled = !(status?.captureEnabled ?? true);
+		chrome.runtime.sendMessage(
+			{ type: 'popup_set_capture', enabled: nextEnabled },
+			(res) => {
+				if (res?.ok) {
+					setStatus((s) =>
+						s ? { ...s, captureEnabled: res.captureEnabled } : s,
+					);
+				}
+			},
+		);
+	}
+
 	function handleForget() {
 		if (!forgetValue.trim()) return;
 		const req: ForgetRequest = {
@@ -51,6 +67,8 @@ export default function App() {
 			setTimeout(() => setForgetMsg(null), 3000);
 		});
 	}
+
+	const paused = !(status?.captureEnabled ?? true);
 
 	const container: React.CSSProperties = {
 		padding: '12px 16px',
@@ -150,7 +168,7 @@ export default function App() {
 		<div style={container}>
 			<div style={header}>
 				<p style={title}>🔖 Vector Bookmark</p>
-				<button style={pauseBtn} onClick={() => setPaused((p) => !p)}>
+				<button style={pauseBtn} onClick={handleToggleCapture}>
 					{paused ? 'Resume' : 'Pause'}
 				</button>
 			</div>
@@ -174,15 +192,19 @@ export default function App() {
 				</div>
 			)}
 
-			<button
-				style={linkBtn}
-				onClick={() => {
-					const port = 7700; // fallback; daemon provides real port
-					chrome.tabs.create({ url: `http://127.0.0.1:${port}/ui` });
-				}}
-			>
-				Open full UI
-			</button>
+			{/* P1-02: use daemon port from status instead of hardcoded 7700 */}
+			{status?.daemonPort && (
+				<button
+					style={linkBtn}
+					onClick={() => {
+						chrome.tabs.create({
+							url: `http://127.0.0.1:${status.daemonPort}/ui`,
+						});
+					}}
+				>
+					Open full UI
+				</button>
+			)}
 
 			<div>
 				<div style={sectionLabel}>Forget</div>
