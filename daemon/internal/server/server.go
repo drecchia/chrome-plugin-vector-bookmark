@@ -40,7 +40,15 @@ func Run() error {
 
 	token := uuid.New().String()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// Default: random port on loopback (native install).
+	// VBM_PORT: fixed port on all interfaces — intended for Docker where the
+	// host-side restriction is enforced by the port mapping (-p 127.0.0.1:PORT:PORT).
+	listenAddr := "127.0.0.1:0"
+	if p := os.Getenv("VBM_PORT"); p != "" {
+		listenAddr = "0.0.0.0:" + p
+	}
+
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}

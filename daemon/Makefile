@@ -1,4 +1,4 @@
-.PHONY: build install uninstall clean tidy test run
+.PHONY: build install uninstall clean tidy test run docker-build docker-up docker-down docker-logs
 
 BIN := bin/vbmd
 
@@ -32,3 +32,17 @@ uninstall:
 
 clean:
 	rm -rf bin/
+
+# ── Docker targets (run from repo root) ───────────────────────────────────────
+docker-build:
+	docker compose -f ../docker-compose.yml build
+
+docker-up:
+	docker compose -f ../docker-compose.yml up -d
+	@echo "Daemon running in Docker. Logs: make docker-logs"
+
+docker-down:
+	docker compose -f ../docker-compose.yml down
+
+docker-logs:
+	docker compose -f ../docker-compose.yml logs -f vbmd

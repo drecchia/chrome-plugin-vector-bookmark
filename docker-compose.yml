@@ -1,0 +1,30 @@
+services:
+  vbmd:
+    build:
+      context: ./daemon
+      dockerfile: Dockerfile
+    container_name: vbmd
+
+    environment:
+      # Fixed port — daemon binds 0.0.0.0:7532 inside the container.
+      # Docker maps it to 127.0.0.1:7532 on the host (loopback-only).
+      VBM_PORT: "7532"
+
+    ports:
+      - "127.0.0.1:7532:7532"
+
+    # Share the data directory with the host so that:
+    #   1. vbm.db persists across container restarts
+    #   2. session.json (port + token) is readable by the NM host shim
+    #      (vbmd nm-host) spawned by Chrome on the host machine
+    volumes:
+      - ${HOME}/.local/share/vbm:/home/vbm/.local/share/vbm
+
+    restart: unless-stopped
+
+    # Log to stdout/stderr (journald or docker logs)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

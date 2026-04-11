@@ -28,14 +28,20 @@ Chrome Extension  ──────────────────▶  Dae
 
 ## Instalação
 
-### Pré-requisitos
+Há duas formas de rodar o daemon: **nativa** (Go instalado na máquina) ou **Docker** (sem dependência de Go). A extensão Chrome é a mesma nos dois casos.
+
+---
+
+### Opção A — Instalação nativa (Go + systemd)
+
+#### Pré-requisitos
 
 - Linux (Ubuntu/Debian/Arch ou derivados)
 - Go 1.22+ instalado
 - Node.js 20+ instalado
 - Google Chrome ou Chromium
 
-### 1. Compilar o daemon
+#### 1. Compilar o daemon
 
 ```bash
 cd daemon
@@ -44,7 +50,7 @@ make build
 
 O binário é gerado em `daemon/bin/vbmd`.
 
-### 2. Compilar a extensão
+##### 2. Compilar a extensão
 
 ```bash
 cd extension
@@ -54,7 +60,7 @@ npm run build
 
 Os arquivos prontos ficam em `extension/dist/`.
 
-### 3. Carregar a extensão no Chrome
+#### 3. Carregar a extensão no Chrome
 
 1. Abra `chrome://extensions/`
 2. Ative o **Modo do desenvolvedor** (canto superior direito)
@@ -62,7 +68,7 @@ Os arquivos prontos ficam em `extension/dist/`.
 4. Selecione a pasta `extension/dist/`
 5. Copie o **ID da extensão** exibido (formato: `abcdefghijklmnopabcdefghijklmnop`)
 
-### 4. Instalar o daemon
+#### 4. Instalar o daemon
 
 ```bash
 cd daemon
@@ -75,7 +81,7 @@ O instalador vai:
 - Instalar o manifesto de Native Messaging em `~/.config/google-chrome/NativeMessagingHosts/`
 - Registrar e iniciar o serviço systemd do usuário
 
-### 5. Verificar a instalação
+#### 5. Verificar a instalação
 
 ```bash
 # Ver status do daemon
@@ -88,6 +94,139 @@ curl http://127.0.0.1:$PORT/healthz
 ```
 
 No Chrome, o ícone da extensão deve aparecer na barra. Clique nele — deve mostrar **"Conectado ao daemon"**.
+
+---
+
+### Opção B — Docker (sem Go na máquina)
+
+Use esta opção se preferir não instalar Go ou quiser isolar o daemon em container.
+
+#### Pré-requisitos
+
+- Linux
+- Docker Engine + Docker Compose plugin
+- Node.js 20+ (apenas para compilar a extensão)
+- Google Chrome ou Chromium
+
+#### 1. Compilar a extensão
+
+```bash
+cd extension
+npm install
+npm run build
+```
+
+#### 2. Carregar a extensão no Chrome
+
+1. Abra `chrome://extensions/`
+2. Ative o **Modo do desenvolvedor**
+3. **Carregar sem compactação** → selecione `extension/dist/`
+4. Copie o **ID da extensão**
+
+#### 3. Instalar o Native Messaging host no host
+
+O Chrome precisa de um binário `vbmd` no host para fazer o handshake inicial (descoberta de porta e token). Com Docker, o container escreve o `session.json` e o binário NM host lê esse arquivo.
+
+**a) Baixe ou compile apenas o binário NM host:**
+
+```bash
+cd daemon
+go build -o bin/vbmd ./cmd/vbmd/
+install -Dm755 bin/vbmd ~/.local/bin/vbmd
+```
+
+Ou, se não quiser Go na máquina, copie o binário de dentro do container após o build:
+
+```bash
+docker compose build
+docker create --name vbmd-tmp vbmd
+docker cp vbmd-tmp:/usr/local/bin/vbmd ~/.local/bin/vbmd
+docker rm vbmd-tmp
+```
+
+**b) Instalar o manifesto de Native Messaging:**
+
+```bash
+mkdir -p ~/.config/google-chrome/NativeMessagingHosts
+cat > ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json <<EOF
+{
+  "name": "com.vbm.daemon",
+  "description": "Vector Bookmark native daemon bridge",
+  "path": "$HOME/.local/bin/vbmd",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://SEU_EXTENSION_ID/"
+  ]
+}
+EOF
+```
+
+Substitua `SEU_EXTENSION_ID` pelo ID copiado no passo 2.
+
+#### 4. Subir o daemon com Docker Compose
+
+```bash
+# Na raiz do projeto
+docker compose up -d
+```
+
+O que acontece:
+- Container sobe o `vbmd server` na porta `7532` internamente
+- Docker expõe exclusivamente `127.0.0.1:7532` no host (loopback apenas)
+- O daemon escreve `~/.local/share/vbm/session.json` via volume compartilhado
+- Quando o Chrome chamar o binário `vbmd nm-host`, ele lê o `session.json` e retorna `{port: 7532, token: "..."}` para a extensão
+
+#### 5. Verificar
+
+```bash
+# Container rodando
+docker compose ps
+
+# Saúde do daemon
+curl http://127.0.0.1:7532/healthz
+# Esperado: {"ok":true}
+
+# Logs em tempo real
+docker compose logs -f vbmd
+```
+
+#### Gerenciamento do container
+
+```bash
+docker compose up -d       # subir
+docker compose down        # parar
+docker compose restart     # reiniciar
+docker compose logs -f     # logs ao vivo
+docker compose pull        # atualizar imagem (futuro)
+```
+
+#### Dados persistidos
+
+O volume mapeia `~/.local/share/vbm/` do host para dentro do container:
+
+```
+~/.local/share/vbm/
+├── vbm.db          # banco SQLite — persiste entre restarts do container
+└── session.json    # porta e token — reescrito a cada restart
+```
+
+Para apagar todos os dados:
+
+```bash
+docker compose down
+rm -rf ~/.local/share/vbm/
+```
+
+#### Diferenças em relação à instalação nativa
+
+| Aspecto | Nativa | Docker |
+|---|---|---|
+| Dependência de Go | Sim (build) | Não (opcional para NM host) |
+| Porta do daemon | Aleatória | Fixa em `7532` |
+| Isolamento | systemd user | Container Docker |
+| Auto-start | `systemctl --user enable` | `restart: unless-stopped` |
+| Logs | `journalctl --user -u vbmd` | `docker compose logs -f` |
+| Dados | `~/.local/share/vbm/` | Mesmo path (volume)
 
 ---
 
