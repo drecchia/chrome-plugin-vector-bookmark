@@ -89,8 +89,13 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 
 	// Auth-protected routes
 	r.Group(func(r chi.Router) {
-		r.Use(authMiddleware(token, extraOrigins))
+		// P0-NEW (v2): corsMiddleware MUST run before authMiddleware so that
+		// Access-Control-Allow-* headers are attached to every response
+		// (including 401 from auth rejection). Without this ordering the
+		// browser turns a CORS-less 401 into a network error, making
+		// VBM_CORS_ORIGIN effectively inoperante for non-preflight requests.
 		r.Use(corsMiddleware(extraOrigins))
+		r.Use(authMiddleware(token, extraOrigins))
 
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
 			var ir ingestRequest

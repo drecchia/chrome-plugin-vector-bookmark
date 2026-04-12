@@ -230,6 +230,43 @@ rm -rf ~/.local/share/vbm/
 
 ---
 
+## Busca semântica com embeddings
+
+Por padrão, o daemon usa um **embedder stub** que produz vetores zero — a busca funciona, mas usa apenas BM25 (casamento textual). Para ativar a busca semântica real (encontrar "artigo sobre paralelismo em Rust" mesmo sem as palavras exatas), configure um modelo de embedding local via **Ollama**.
+
+### Setup rápido
+
+```bash
+# 1. Instalar Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 2. Baixar modelo (274 MB, 768 dimensões, rápido)
+ollama pull nomic-embed-text
+
+# 3. Apontar o daemon para Ollama
+systemctl --user edit vbmd
+```
+
+No editor que abrir, adicione:
+
+```ini
+[Service]
+Environment=VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+Environment=VBM_EMBED_MODEL=nomic-embed-text
+```
+
+Salvar e reiniciar:
+
+```bash
+systemctl --user daemon-reload && systemctl --user restart vbmd
+```
+
+Novas páginas capturadas já nascem com embeddings reais. Páginas capturadas antes continuam com vetores stub (o campo `model_ver` preserva a versão) — para re-vetorizar tudo, apague `~/.local/share/vbm/vbm.db` e re-capture.
+
+Para detalhes (modelos alternativos, migração, troubleshooting do embedder), veja `docs/OPERATIONS.md §4`.
+
+---
+
 ## Uso diário
 
 ### Busca pela barra de endereços
@@ -243,6 +280,32 @@ Digite `@recall` seguido de espaço na barra de endereços do Chrome, depois sua
 ```
 
 Os 5 melhores resultados aparecem como sugestões com trecho do conteúdo, domínio e data da visita. Pressione Enter ou clique para abrir.
+
+#### Dicas de query
+
+A busca faz **fusão RRF** (BM25 + cosine). Query de 2 a 5 palavras dá o melhor resultado — termo único reduz o BM25 a ranking simples, e queries longas demais diluem a semântica.
+
+**Exemplos que funcionam bem:**
+
+```
+@recall pagamento pix brasil
+@recall react hooks useeffect cleanup
+@recall comparação tokio async-std performance
+@recall docker compose volume persistência
+@recall tutorial prometheus scrape config
+```
+
+**Exemplos ruins** (muito curtos ou genéricos):
+
+```
+@recall docker          # muito amplo — milhares de páginas match
+@recall configuração    # zero sinal semântico
+```
+
+Se a busca não achar o que você lembra ter lido:
+- Tente termos do trecho específico que você lembra, não só o tópico
+- Adicione o domínio mental: `@recall stackoverflow async await python`
+- Se configurou embeddings reais (§Busca semântica), queries em linguagem natural longas funcionam melhor que palavras-chave soltas
 
 ### Interface local completa
 
@@ -307,6 +370,47 @@ Na primeira visita a qualquer domínio, a extensão pede confirmação antes de 
 ├── vbm.db          # banco SQLite com chunks, embeddings e metadados
 └── session.json    # porta e token da sessão atual (chmod 600)
 ```
+
+### FAQ de Privacidade
+
+**Algum dado é enviado para servidores externos?**
+Não. Em v0.1, toda a stack roda em `127.0.0.1` (bind exclusivo em loopback). Não há telemetria, analytics, ou chamadas a APIs externas. Se você configurar `VBM_EMBED_URL` apontando para Ollama local, o texto dos seus chunks sai do daemon mas só para outro processo na mesma máquina.
+
+**E se eu abrir uma página sensível (banco, login, CPF, saúde)?**
+Três camadas de proteção:
+1. **Janelas anônimas nunca são capturadas** (`incognito: not_allowed` no manifest — não é configurável).
+2. **Denylist de 24 domínios + padrões de URL** (`.gov`, `.mil`, `/login`, `/checkout`, bancos, webmail, password managers) bloqueia captura antes mesmo do envio ao daemon.
+3. **Detecção de campos sensíveis no content script** — se a página tem `input[type=password]` ou campo de cartão focado, a captura fica suspensa enquanto o campo estiver em uso.
+
+**Posso apagar uma página, domínio ou período específico?**
+Sim, de três formas:
+- **Popup da extensão**: campo "Esquecer URL" ou "Esquecer domínio".
+- **UI local** em `http://127.0.0.1:PORTA/ui`: botão ao lado de cada página.
+- **API direta** (útil para scripts): `DELETE /forget` com `{"type":"url|domain|timerange","value":"..."}` — veja `docs/OPERATIONS.md §5.3`.
+
+A remoção é **física**: `DELETE FROM pages` + rebuild do FTS5, sem soft-delete, sem lixeira.
+
+**Por quanto tempo meus dados ficam armazenados?**
+Indefinidamente por padrão. Para retenção automática (LGPD-friendly), configure `VBM_TTL_DAYS=N` — páginas mais antigas que N dias são removidas por uma goroutine diária. Ver `docs/OPERATIONS.md §5`.
+
+**Como faço backup / exportação dos meus dados?**
+
+```bash
+# Backup cru do banco
+cp ~/.local/share/vbm/vbm.db ~/backup-$(date +%F).db
+
+# Exportação estruturada via API (JSON, sem embeddings)
+PORT=$(jq -r .port ~/.local/share/vbm/session.json)
+TOKEN=$(jq -r .token ~/.local/share/vbm/session.json)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$PORT/export" > export.json
+```
+
+**Outro usuário na mesma máquina consegue ler meus dados?**
+Não por padrão — `~/.local/share/vbm/` herda permissões da home do usuário (tipicamente `700`). O `session.json` é explicitamente `chmod 600`. Um usuário com permissão `sudo`, entretanto, consegue ler — o Vector Bookmark não é defesa contra root.
+
+**O que acontece se o daemon crashar no meio de uma ingestão?**
+A fila tem capacidade 256 e é drenada com timeout de 30s no shutdown gracioso (SIGTERM). Crash forçado (SIGKILL) perde o que estiver em vôo. O banco tem WAL mode, então não corrompe.
 
 ---
 
