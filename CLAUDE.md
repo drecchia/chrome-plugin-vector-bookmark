@@ -12,7 +12,7 @@ Vector Bookmark é um sistema de memória semântica de navegação composto por
 | Extensão | TypeScript 5.4, Vite 5, CRXJS 2.0-beta, React 18, `@mozilla/readability` |
 | Banco | SQLite (WAL mode, FTS5 virtual table, embeddings como BLOB float32) |
 | IPC | Chrome Native Messaging (handshake) + localhost HTTP + WebSocket |
-| OS | Linux (systemd user unit) — macOS/Windows não suportados em v0.1 |
+| OS | Linux (systemd user unit), Windows 10/11 (Task Scheduler) — macOS pendente |
 
 ## Estrutura do projeto
 

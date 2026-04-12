@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 type handshakeRequest struct {
@@ -27,14 +28,32 @@ type Session struct {
 	Token string `json:"token"`
 }
 
-// SessionPath returns the path to the session file.
-// Returns an error if the home directory cannot be determined.
-func SessionPath() (string, error) {
+// DataDir returns the platform-specific directory where vbm stores its data.
+//   - Linux/macOS: ~/.local/share/vbm
+//   - Windows:     %APPDATA%\vbm
+func DataDir() (string, error) {
+	if runtime.GOOS == "windows" {
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			return "", fmt.Errorf("APPDATA environment variable not set")
+		}
+		return filepath.Join(appData, "vbm"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
-	return filepath.Join(home, ".local", "share", "vbm", "session.json"), nil
+	return filepath.Join(home, ".local", "share", "vbm"), nil
+}
+
+// SessionPath returns the path to the session file.
+// Returns an error if the data directory cannot be determined.
+func SessionPath() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "session.json"), nil
 }
 
 func readSession() (*Session, error) {

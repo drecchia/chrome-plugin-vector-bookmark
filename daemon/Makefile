@@ -1,10 +1,17 @@
-.PHONY: build install uninstall clean tidy test run docker-build docker-up docker-down docker-logs
+.PHONY: build build-windows build-all install uninstall clean tidy test run docker-build docker-up docker-down docker-logs
 
-BIN := bin/vbmd
+BIN     := bin/vbmd
+BIN_WIN := bin/vbmd.exe
 
 build:
 	@mkdir -p bin
 	go build -o $(BIN) ./cmd/vbmd/
+
+build-windows:
+	@mkdir -p bin
+	GOOS=windows GOARCH=amd64 go build -o $(BIN_WIN) ./cmd/vbmd/
+
+build-all: build build-windows
 
 tidy:
 	go mod tidy

@@ -63,6 +63,8 @@ export default function App() {
 		display: 'flex',
 		flexDirection: 'column',
 		gap: '10px',
+		boxSizing: 'border-box',
+		overflow: 'hidden',
 	};
 
 	const header: React.CSSProperties = {
@@ -95,38 +97,49 @@ export default function App() {
 	};
 
 	const gray: React.CSSProperties = { color: '#9ca3af' };
-	const red: React.CSSProperties = { color: '#dc2626', fontSize: '12px' };
+	const errorBox: React.CSSProperties = {
+		fontSize: '12px',
+		color: '#991b1b',
+		background: '#fef2f2',
+		border: '1px solid #fecaca',
+		borderRadius: '4px',
+		padding: '6px 8px',
+		lineHeight: '1.4',
+	};
 
 	const sectionLabel: React.CSSProperties = {
 		fontSize: '11px',
 		fontWeight: 600,
-		textTransform: 'uppercase',
 		color: '#6b7280',
-		letterSpacing: '0.05em',
+		letterSpacing: '0.02em',
 	};
 
 	const row: React.CSSProperties = { display: 'flex', gap: '6px' };
 
 	const input: React.CSSProperties = {
 		flex: 1,
+		minWidth: 0,
 		fontSize: '12px',
-		padding: '4px 8px',
+		padding: '5px 8px',
 		border: '1px solid #d1d5db',
 		borderRadius: '4px',
 		outline: 'none',
+		boxSizing: 'border-box',
 	};
 
 	const select: React.CSSProperties = {
+		flexShrink: 0,
 		fontSize: '12px',
-		padding: '4px 6px',
+		padding: '5px 6px',
 		border: '1px solid #d1d5db',
 		borderRadius: '4px',
 		background: '#fff',
 	};
 
 	const btn: React.CSSProperties = {
+		flexShrink: 0,
 		fontSize: '12px',
-		padding: '4px 10px',
+		padding: '5px 10px',
 		border: 'none',
 		borderRadius: '4px',
 		background: '#ef4444',
@@ -150,6 +163,7 @@ export default function App() {
 		color: '#9ca3af',
 		borderTop: '1px solid #f3f4f6',
 		paddingTop: '8px',
+		marginTop: '2px',
 	};
 
 	return (
@@ -167,7 +181,7 @@ export default function App() {
 				</div>
 			)}
 
-			{error && <div style={red}>Error: {error}</div>}
+			{error && <div style={errorBox}>{error}</div>}
 
 			{status && (
 				<div style={statusRow}>

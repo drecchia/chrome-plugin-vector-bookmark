@@ -5,6 +5,9 @@ Documentation=https://github.com/vbm/vector-bookmark
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/vbmd server
+# Optional config file — create/edit this to set VBM_PORT, VBM_BIND, etc.
+# Survives daemon upgrades (make install never touches this file).
+EnvironmentFile=-%h/.config/vbm/env
 Restart=on-failure
 RestartSec=3s
 # Systemd hardening

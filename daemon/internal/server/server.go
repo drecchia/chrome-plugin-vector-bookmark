@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,11 +24,10 @@ const version = "0.1.0"
 
 // Run starts the daemon server. Blocks until SIGTERM/SIGINT.
 func Run() error {
-	home, err := os.UserHomeDir()
+	dataDir, err := nm.DataDir()
 	if err != nil {
-		return fmt.Errorf("home dir: %w", err)
+		return fmt.Errorf("data dir: %w", err)
 	}
-	dataDir := filepath.Join(home, ".local", "share", "vbm")
 
 	// P0-02: select embedder based on VBM_EMBED_URL.
 	var embedder embed.Embedder = embed.NewStubEmbedder()

@@ -72,22 +72,58 @@ Todas as variáveis são lidas no startup do daemon (`daemon/internal/server/ser
 | `VBM_LOG_LEVEL` | `info` | Não | `debug` / `info` / `warn` / `error`. Handler é slog JSON em stderr. |
 | `VBM_CORS_ORIGIN` | *(vazio)* | Condicional | CSV de origens extras (além de `chrome-extension://*`) aceitas para requisições HTTP. Necessário para dashboards externos. |
 
-**Exemplo de override via systemd drop-in:**
+**Caminhos de dados por plataforma:**
+
+| Plataforma | Data dir | Config file |
+|---|---|---|
+| Linux | `~/.local/share/vbm/` | `~/.config/vbm/env` (via systemd `EnvironmentFile`) |
+| Windows | `%APPDATA%\vbm\` | `%APPDATA%\vbm\env` (carregado por `loadEnvFile()` no startup) |
+
+**Configuracao persistente — Linux (`~/.config/vbm/env`):**
+
+O servico carrega automaticamente `~/.config/vbm/env` no startup (via `EnvironmentFile` no `vbmd.service`). Este arquivo **nao e sobrescrito por `make install`**, entao configuracoes sobrevivem a upgrades.
 
 ```bash
-systemctl --user edit vbmd
+mkdir -p ~/.config/vbm
+# Editar com qualquer editor — uma variavel por linha, sem aspas necessarias
+nano ~/.config/vbm/env
 ```
 
 ```ini
-[Service]
-Environment=VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-Environment=VBM_EMBED_MODEL=nomic-embed-text
-Environment=VBM_TTL_DAYS=90
-Environment=VBM_LOG_LEVEL=info
-Environment=VBM_CORS_ORIGIN=http://localhost:3000,http://localhost:8080
+VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+VBM_EMBED_MODEL=nomic-embed-text
+VBM_TTL_DAYS=90
+VBM_LOG_LEVEL=info
+VBM_CORS_ORIGIN=http://localhost:3000,http://localhost:8080
 ```
 
-Salvar, depois `systemctl --user daemon-reload && systemctl --user restart vbmd`.
+Aplicar sem reiniciar a maquina:
+
+```bash
+systemctl --user restart vbmd
+```
+
+**Configuracao persistente — Windows (`%APPDATA%\vbm\env`):**
+
+```powershell
+# Criar/editar arquivo de configuracao
+notepad "$env:APPDATA\vbm\env"
+```
+
+```ini
+VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+VBM_EMBED_MODEL=nomic-embed-text
+VBM_TTL_DAYS=90
+VBM_LOG_LEVEL=info
+VBM_CORS_ORIGIN=http://localhost:3000
+```
+
+Reiniciar o daemon para aplicar:
+
+```powershell
+Stop-Process -Name "vbmd" -ErrorAction SilentlyContinue
+Start-Process -FilePath "$env:LOCALAPPDATA\vbm\vbmd.exe" -ArgumentList "server" -WindowStyle Hidden
+```
 
 ---
 
@@ -120,17 +156,13 @@ Modelos alternativos suportados (contanto que exponham `/api/embeddings`):
 ### 4.3 Configurar o daemon
 
 ```bash
-systemctl --user edit vbmd
-```
+mkdir -p ~/.config/vbm
+cat >> ~/.config/vbm/env <<'EOF'
+VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+VBM_EMBED_MODEL=nomic-embed-text
+EOF
 
-```ini
-[Service]
-Environment=VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-Environment=VBM_EMBED_MODEL=nomic-embed-text
-```
-
-```bash
-systemctl --user daemon-reload && systemctl --user restart vbmd
+systemctl --user restart vbmd
 ```
 
 ### 4.4 Formato do protocolo
@@ -457,17 +489,21 @@ systemctl --user start vbmd
 # 1. Parar e remover serviço
 systemctl --user stop vbmd
 systemctl --user disable vbmd
-rm ~/.config/systemd/user/vbmd.service
+rm -f ~/.config/systemd/user/vbmd.service
 systemctl --user daemon-reload
 
 # 2. Remover binário e NM host
-rm ~/.local/bin/vbmd
-rm ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json
+rm -f ~/.local/bin/vbmd
+rm -f ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json
+rm -f ~/.config/chromium/NativeMessagingHosts/com.vbm.daemon.json
 
-# 3. Remover dados (LGPD — apagamento completo)
+# 3. Remover configurações persistentes
+rm -rf ~/.config/vbm/
+
+# 4. Remover dados (LGPD — apagamento completo, opcional)
 rm -rf ~/.local/share/vbm/
 
-# 4. Remover extensão do Chrome manualmente em chrome://extensions
+# 5. Remover extensão do Chrome manualmente em chrome://extensions
 ```
 
 Alternativa: `cd daemon && make uninstall` (cobre passos 1 e 2; dados permanecem em `~/.local/share/vbm/` intencionalmente para evitar perda acidental).

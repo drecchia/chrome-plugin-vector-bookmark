@@ -18,6 +18,18 @@
 | UI popup | React 18 | Componentes reativos, sem dependências extras |
 | Extração HTML | `@mozilla/readability` | Padrão da indústria para extração de artigo |
 
+## Suporte a plataformas (CR-007)
+
+| OS | Suportado | Data dir | Config file | Auto-start |
+|---|---|---|---|---|
+| Linux | Sim (v0.1+) | `~/.local/share/vbm/` | `~/.config/vbm/env` via systemd `EnvironmentFile` | systemd user unit |
+| Windows 10/11 | Sim (CR-007) | `%APPDATA%\vbm\` | `%APPDATA%\vbm\env` carregado por `loadEnvFile()` em `main.go` | Task Scheduler (sem admin) |
+| macOS | Pendente | — | — | — |
+
+**Decisão de paths:** usar `runtime.GOOS` em `nm.DataDir()` para retornar o diretório correto por plataforma. Linux usa `~/.local/share/vbm/` (XDG); Windows usa `%APPDATA%\vbm\` (AppData roaming). Ambos são resolvidos em `internal/nm/host.go` — ponto único de verdade consumido por `nm.SessionPath()` e `server.Run()`.
+
+---
+
 ## Padrões globais observados
 
 - **IDs**: `INTEGER PRIMARY KEY AUTOINCREMENT` no SQLite; sem UUID como PK de tabela

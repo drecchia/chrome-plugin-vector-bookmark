@@ -244,21 +244,12 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull nomic-embed-text
 
 # 3. Apontar o daemon para Ollama
-systemctl --user edit vbmd
-```
-
-No editor que abrir, adicione:
-
-```ini
-[Service]
-Environment=VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-Environment=VBM_EMBED_MODEL=nomic-embed-text
-```
-
-Salvar e reiniciar:
-
-```bash
-systemctl --user daemon-reload && systemctl --user restart vbmd
+mkdir -p ~/.config/vbm
+cat >> ~/.config/vbm/env <<'EOF'
+VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+VBM_EMBED_MODEL=nomic-embed-text
+EOF
+systemctl --user restart vbmd
 ```
 
 Novas páginas capturadas já nascem com embeddings reais. Páginas capturadas antes continuam com vetores stub (o campo `model_ver` preserva a versão) — para re-vetorizar tudo, apague `~/.local/share/vbm/vbm.db` e re-capture.
