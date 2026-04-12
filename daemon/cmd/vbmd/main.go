@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/vbm/daemon/internal/nm"
@@ -21,8 +22,14 @@ func main() {
 			os.Exit(1)
 		}
 	case "server":
+		// P1-13: structured JSON logs. Level controlled by VBM_LOG_LEVEL=debug.
+		logLevel := slog.LevelInfo
+		if os.Getenv("VBM_LOG_LEVEL") == "debug" {
+			logLevel = slog.LevelDebug
+		}
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 		if err := server.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+			slog.Error("server error", "err", err)
 			os.Exit(1)
 		}
 	default:

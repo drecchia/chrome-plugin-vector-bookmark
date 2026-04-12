@@ -1,17 +1,5 @@
 import React, { useEffect, useState } from 'react';
-
-interface StatusResponse {
-	indexed: number;
-	pending: number;
-	version: string;
-	daemonPort: number | null;
-	captureEnabled: boolean;
-}
-
-interface ForgetRequest {
-	type: 'url' | 'domain' | 'timerange';
-	value: string;
-}
+import type { StatusResponse, ForgetRequest } from '../../../proto/types';
 
 export default function App() {
 	const [status, setStatus] = useState<StatusResponse | null>(null);

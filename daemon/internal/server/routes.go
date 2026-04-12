@@ -2,7 +2,7 @@ package server
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -89,7 +89,7 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 
 	// Auth-protected routes
 	r.Group(func(r chi.Router) {
-		r.Use(authMiddleware(token))
+		r.Use(authMiddleware(token, extraOrigins))
 		r.Use(corsMiddleware(extraOrigins))
 
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
@@ -109,7 +109,7 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 			q.Enqueue(ireq)
 			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
 			if err := s.AddQueueItem(ireq); err != nil {
-				log.Printf("[ingest] queue persist error for %s: %v", ir.URL, err)
+				slog.Warn("queue persist error", "url", ir.URL, "err", err)
 			}
 			m.ingestTotal.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -297,7 +297,13 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 	return r
 }
 
-func authMiddleware(token string) func(http.Handler) http.Handler {
+func authMiddleware(token string, extraOrigins []string) func(http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(extraOrigins))
+	for _, o := range extraOrigins {
+		if o != "" {
+			allowed[o] = true
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Handle CORS preflight without auth check
@@ -306,9 +312,9 @@ func authMiddleware(token string) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Check Origin header
+			// Check Origin header — allow chrome-extension:// and any extraOrigins (P0-NEW: fix ordering bug)
 			origin := r.Header.Get("Origin")
-			if origin != "" && !strings.HasPrefix(origin, "chrome-extension://") {
+			if origin != "" && !strings.HasPrefix(origin, "chrome-extension://") && !allowed[origin] {
 				http.Error(w, `{"error":"forbidden origin"}`, http.StatusUnauthorized)
 				return
 			}

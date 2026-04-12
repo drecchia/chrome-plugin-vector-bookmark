@@ -1,7 +1,7 @@
 package queue
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/vbm/daemon/internal/store"
@@ -27,7 +27,7 @@ func (q *Queue) Enqueue(req store.IngestRequest) {
 	select {
 	case q.ch <- req:
 	default:
-		log.Printf("[queue] dropped ingest for %s: buffer full", req.URL)
+		slog.Warn("dropped ingest, buffer full", "url", req.URL)
 	}
 }
 
@@ -46,12 +46,12 @@ func (q *Queue) worker() {
 	defer q.wg.Done()
 	for req := range q.ch {
 		if err := q.store.Ingest(req); err != nil {
-			log.Printf("[queue] ingest error for %s: %v", req.URL, err)
+			slog.Error("ingest error", "url", req.URL, "err", err)
 			continue
 		}
 		// P2-02: remove from persistent queue after successful ingest.
 		if err := q.store.RemoveQueueItem(req.URL); err != nil {
-			log.Printf("[queue] remove queue item error for %s: %v", req.URL, err)
+			slog.Warn("remove queue item error", "url", req.URL, "err", err)
 		}
 	}
 }

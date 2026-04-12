@@ -13,6 +13,7 @@
 | Banco de dados | `modernc.org/sqlite` (pure Go) | Sem CGO, FTS5 incluso, arquivo único |
 | WebSocket | `gorilla/websocket` | Maturidade, API simples |
 | UUID | `google/uuid` | Geração de tokens de sessão |
+| Logging | `log/slog` (stdlib Go 1.21+) | JSON estruturado, sem dependência externa; nível via `VBM_LOG_LEVEL` |
 | Extensão | TypeScript 5.4 + Vite 5 + CRXJS | Bundle MV3 com hot-reload em dev |
 | UI popup | React 18 | Componentes reativos, sem dependências extras |
 | Extração HTML | `@mozilla/readability` | Padrão da indústria para extração de artigo |
@@ -82,13 +83,13 @@ queue
 - **Separação de modos no binário**: `vbmd server` vs `vbmd nm-host` — mesmo binário, dois comportamentos. NM host é efêmero (executa e sai), server é persistente (systemd).
 - **Queue in-memory**: `queue.Queue` é um canal Go, não persiste no SQLite (a tabela `queue` existe mas o worker atual não a usa). Se o daemon reiniciar com itens no canal, eles são perdidos.
 - **FTS5 rebuild explícito**: `INSERT INTO chunks_fts(...) VALUES('rebuild')` chamado após `Forget` — operação síncrona e bloqueante.
-- **CORS restrito**: `Origin` deve iniciar com `chrome-extension://` — bloqueia qualquer cliente que não seja a extensão Chrome.
+- **CORS configurável**: por padrão só aceita `Origin: chrome-extension://`. Origens adicionais (dashboard local, ferramentas de dev) configuradas via `VBM_CORS_ORIGIN=http://host1,http://host2`. Tanto `authMiddleware` quanto `corsMiddleware` verificam a lista — bug de ordering onde auth rejeitava antes de cors agir foi corrigido em CR-005.
+- **Logging estruturado**: `log/slog` com `JSONHandler` para stderr — configurado em `main.go` antes de `server.Run()`. Nível padrão `INFO`; `VBM_LOG_LEVEL=debug` ativa nível `DEBUG`. Binário `nm-host` não inicializa slog (saída stderr seria texto puro, stdout reservado para protocolo NM binário).
 - **UI placeholder**: `/ui/*` retorna HTML estático hardcoded na rota; sem sistema de templates, sem `go:embed` real ainda.
 - **Port aleatório**: `net.Listen("tcp", "127.0.0.1:0")` — porta muda a cada restart, descoberta via `session.json`.
 
 ⚠️ DECISÕES NÃO CLARAS (revisar):
 
-- `queue` table no SQLite existe no schema mas o worker (`queue.Queue`) não persiste nela — há duas implementações de fila com semânticas diferentes. Definir qual é a fonte de verdade.
 - Tombstones mencionados no PRD como requisito de `Forget` mas não implementados — `DELETE` é físico. Se sincronização cruzada for adicionada (v0.3), tombstones serão necessários.
 - `model_ver` em `pages` e `chunks` são definidos como `DEFAULT 'stub-v0'` mas não há lógica de re-embed quando o valor muda — pipeline de migração ainda não implementado.
 - `updated_at` na tabela `queue` nunca é atualizado pelo código atual.
@@ -125,7 +126,6 @@ DaemonState   { port: number | null, token: string | null }
 
 - **Opt-in por domínio não implementado**: o PRD e o GUIA descrevem confirmação por eTLD+1, mas o código atual faz `setOptIn(domain, true)` automaticamente. Decisão pendente: exibir prompt ou capturar silenciosamente.
 - **Denylist aplicada depois da extração**: o content script extrai o texto antes do SW checar o denylist. Para domínios sensíveis que passarem pela verificação de URL (ex: domínio novo), o texto já foi lido do DOM. Avaliar se a checagem deve acontecer no content script também.
-- **`paused` state no popup**: o botão de pause existe no `App.tsx` mas não há implementação de persistência do estado de pausa — o SW não verifica nenhuma flag de pausa antes de aceitar `page_viewed`.
 - **`chrome.storage` não usado para nada**: declarado nas permissões mas sem leitura/escrita no código atual.
 - **`idle` permission declarada mas não usada**: `chrome.idle` está nas permissões mas não há chamada no código.
 

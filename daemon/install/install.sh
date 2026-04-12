@@ -32,28 +32,38 @@ mkdir -p "$HOME/.local/share/vbm"
 mkdir -p "$HOME/.config/systemd/user"
 cp "$SCRIPT_DIR/vbmd.service" "$HOME/.config/systemd/user/vbmd.service"
 
-# Prompt for Chrome extension ID
+# Prompt for Chrome extension ID — strictly validate before continuing (P1-14).
+# EXTENSION_ID can be pre-set as an env var for non-interactive / CI use.
 echo ""
 echo "=== Vector Bookmark Installer ==="
 echo ""
-echo "To complete setup, you need your Chrome extension ID."
-echo "1. Open Chrome → chrome://extensions/"
-echo "2. Enable Developer mode"
-echo "3. Load unpacked → select the 'extension/' folder"
-echo "4. Copy the extension ID shown"
-echo ""
-read -p "Extension ID (leave blank to set later): " EXTENSION_ID
-
-# Validate extension ID: Chrome extension IDs are exactly 32 lowercase letters a-p
-if [ -n "$EXTENSION_ID" ]; then
-  if ! echo "$EXTENSION_ID" | grep -qE '^[a-p]{32}$'; then
+if [ -z "$EXTENSION_ID" ]; then
+  if [ -t 0 ]; then
+    echo "To complete setup, you need your Chrome extension ID."
+    echo "1. Open Chrome -> chrome://extensions/"
+    echo "2. Enable Developer mode"
+    echo "3. Load unpacked -> select the 'extension/' folder"
+    echo "4. Copy the extension ID shown"
     echo ""
-    echo "WARNING: '$EXTENSION_ID' does not look like a valid Chrome extension ID."
-    echo "  Expected: 32 lowercase letters (a-p). Example: abcdefghijklmnopabcdefghijklmnop"
-    echo "  The NM manifest will be installed but may not work until the ID is corrected."
-    echo "  Re-run: EXTENSION_ID=<correct_id> bash $0"
-    echo ""
+    while true; do
+      read -r -p "Extension ID (32 lowercase a-p chars): " EXTENSION_ID
+      if echo "$EXTENSION_ID" | grep -qE '^[a-p]{32}$'; then
+        break
+      fi
+      echo "ERROR: '$EXTENSION_ID' is not a valid Chrome extension ID." >&2
+      echo "  Expected: exactly 32 lowercase letters a-p" >&2
+      echo "  Example:  abcdefghijklmnopabcdefghijklmnop" >&2
+    done
+  else
+    echo "ERROR: EXTENSION_ID env var not set. Run:" >&2
+    echo "  EXTENSION_ID=<32-char-id> bash $0 [binary-path]" >&2
+    exit 1
   fi
+elif ! echo "$EXTENSION_ID" | grep -qE '^[a-p]{32}$'; then
+  echo "ERROR: EXTENSION_ID='$EXTENSION_ID' is not a valid Chrome extension ID." >&2
+  echo "  Expected: exactly 32 lowercase letters a-p" >&2
+  echo "  Example:  abcdefghijklmnopabcdefghijklmnop" >&2
+  exit 1
 fi
 
 # Install NM manifest for Chrome
@@ -61,7 +71,7 @@ CHROME_NM_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
 mkdir -p "$CHROME_NM_DIR"
 sed \
   -e "s|BINARY_PATH|$BINARY|g" \
-  -e "s|EXTENSION_ID|${EXTENSION_ID:-REPLACE_ME}|g" \
+  -e "s|EXTENSION_ID|${EXTENSION_ID}|g" \
   "$SCRIPT_DIR/native-messaging-host.json" \
   > "$CHROME_NM_DIR/com.vbm.daemon.json"
 
@@ -92,14 +102,7 @@ echo ""
 echo "=== Installation complete ==="
 echo ""
 echo "Next steps:"
-if [ -z "$EXTENSION_ID" ] || [ "${EXTENSION_ID:-REPLACE_ME}" = "REPLACE_ME" ]; then
-  echo "  1. Load the extension in Chrome (chrome://extensions/ → Load unpacked → extension/dist/)"
-  echo "  2. Copy the extension ID and run:"
-  echo "       EXTENSION_ID=<your_id> bash $SCRIPT_DIR/install.sh"
-  echo "     Or manually edit: $CHROME_NM_DIR/com.vbm.daemon.json"
-else
-  echo "  1. Restart Chrome so the NM manifest is picked up"
-  echo "  2. The extension popup should show 'Connected to daemon'"
-fi
+echo "  1. Restart Chrome so the NM manifest is picked up"
+echo "  2. The extension popup should show 'Connected to daemon'"
 echo ""
 echo "Verify daemon: curl http://127.0.0.1:\$(python3 -c \"import json; d=json.load(open('$HOME/.local/share/vbm/session.json')); print(d['port'])\")/healthz"

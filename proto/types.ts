@@ -44,6 +44,8 @@ export interface StatusResponse {
 	indexed: number;
 	pending: number;
 	version: string;
+	daemonPort: number | null;
+	captureEnabled: boolean;
 }
 
 // ---- WebSocket push ----

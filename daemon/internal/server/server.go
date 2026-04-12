@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -36,9 +36,9 @@ func Run() error {
 	if u := os.Getenv("VBM_EMBED_URL"); u != "" {
 		model := os.Getenv("VBM_EMBED_MODEL")
 		embedder = embed.NewHttpEmbedder(u, model)
-		log.Printf("[vbmd] using HTTP embedder: %s (model: %s)", u, model)
+		slog.Info("using HTTP embedder", "url", u, "model", model)
 	} else {
-		log.Printf("[vbmd] WARNING: VBM_EMBED_URL not set — using stub embedder (BM25-only, no semantic search)")
+		slog.Warn("VBM_EMBED_URL not set, using stub embedder (BM25-only, no semantic search)")
 	}
 
 	s, err := store.New(dataDir, embedder)
@@ -58,7 +58,7 @@ func Run() error {
 		bind := "127.0.0.1"
 		if b := os.Getenv("VBM_BIND"); b != "" {
 			bind = b
-			log.Printf("[vbmd] WARNING: binding on %s — ensure firewall restricts access", bind)
+			slog.Warn("binding on non-loopback interface", "bind", bind)
 		}
 		listenAddr = bind + ":" + p
 	}
@@ -76,25 +76,25 @@ func Run() error {
 		defer os.Remove(sessionPath)
 	}
 
-	log.Printf("[vbmd] server listening on %s", listener.Addr().String())
+	slog.Info("server listening", "addr", listener.Addr().String())
 
 	// P0-07: start periodic cleanup if VBM_TTL_DAYS is set.
 	if t := os.Getenv("VBM_TTL_DAYS"); t != "" {
 		if ttlDays, err := strconv.Atoi(t); err == nil && ttlDays > 0 {
-			log.Printf("[vbmd] data retention: %d days", ttlDays)
+			slog.Info("data retention enabled", "ttl_days", ttlDays)
 			go func() {
 				if n, err := s.Cleanup(ttlDays); err != nil {
-					log.Printf("[vbmd] cleanup error: %v", err)
+					slog.Error("startup cleanup error", "err", err)
 				} else if n > 0 {
-					log.Printf("[vbmd] startup cleanup: removed %d pages", n)
+					slog.Info("startup cleanup complete", "pages_removed", n)
 				}
 				ticker := time.NewTicker(24 * time.Hour)
 				defer ticker.Stop()
 				for range ticker.C {
 					if n, err := s.Cleanup(ttlDays); err != nil {
-						log.Printf("[vbmd] cleanup error: %v", err)
+						slog.Error("cleanup error", "err", err)
 					} else if n > 0 {
-						log.Printf("[vbmd] cleanup: removed %d pages", n)
+						slog.Info("cleanup complete", "pages_removed", n)
 					}
 				}
 			}()
@@ -121,12 +121,12 @@ func Run() error {
 	// P0-04: drain queue after HTTP server shuts down.
 	go func() {
 		<-ctx.Done()
-		log.Println("[vbmd] shutting down HTTP server...")
+		slog.Info("shutting down HTTP server")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(shutCtx) //nolint:errcheck
 
-		log.Println("[vbmd] draining ingest queue...")
+		slog.Info("draining ingest queue")
 		q.Close()
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer drainCancel()
@@ -134,9 +134,9 @@ func Run() error {
 		go func() { q.Wait(); close(done) }()
 		select {
 		case <-done:
-			log.Println("[vbmd] queue drained")
+			slog.Info("queue drained")
 		case <-drainCtx.Done():
-			log.Println("[vbmd] queue drain timeout — some pending items may be lost")
+			slog.Warn("queue drain timeout, some pending items may be lost")
 		}
 	}()
 
