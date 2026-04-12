@@ -4,7 +4,14 @@
 	"version": "0.1.0",
 	"description": "Semantic recall for everything you've read.",
 	"incognito": "not_allowed",
-	"permissions": ["tabs", "webNavigation", "storage", "omnibox", "idle"],
+	"permissions": [
+		"tabs",
+		"webNavigation",
+		"storage",
+		"omnibox",
+		"idle",
+		"scripting"
+	],
 	"host_permissions": ["<all_urls>"],
 	"background": {
 		"service_worker": "src/background/service-worker.ts",

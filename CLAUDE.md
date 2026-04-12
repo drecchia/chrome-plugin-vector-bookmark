@@ -69,7 +69,7 @@ Vector Bookmark é um sistema de memória semântica de navegação composto por
 5. **Queue com backpressure**: canal com capacidade 256. Se cheio, ingest é descartado com log — sem bloqueio do caller HTTP.
 6. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force sobre BLOBs → fusão Reciprocal Rank Fusion k=60. Limite: 5 por default, 20 por máximo.
 7. **Segurança**: bind exclusivo em `127.0.0.1`. Sem token de autenticação — acesso limitado a processos locais.
-8. **Privacidade na captura**: `incognito:not_allowed` no manifest. Denylist de 24 domínios + `.gov`/`.mil` + 14 padrões de URL aplicados no SW.
+8. **Privacidade na captura**: `incognito:not_allowed` no manifest. Denylist de 24 domínios + `.gov`/`.mil` + 14 padrões de URL aplicados no SW. Blacklist gerenciável pelo usuário armazenada no daemon (tabela `blocklist`) — suffix match para domínios simples, regex para entradas `/pattern/`; SW faz polling a cada 60s e migra automaticamente de `chrome.storage.local` na primeira execução.
 
 ## O que nunca fazer
 
@@ -84,10 +84,11 @@ Vector Bookmark é um sistema de memória semântica de navegação composto por
 ## Entidades principais
 
 ```
-pages       id, url, url_hash (UNIQUE), title, domain, visit_ts (ms), dwell_ms, model_ver
+pages       id, url, url_hash (UNIQUE), title, domain, visit_ts (ms), dwell_ms, model_ver, star_rank (0|1)
 chunks      id, page_id (FK→pages CASCADE), chunk_idx, text, text_hash, embedding (BLOB f32), model_ver
 chunks_fts  virtual FTS5 sobre chunks.text
 queue       id, url, title, text, visit_ts, dwell_ms, domain, status, created_at
+blocklist   pattern (PRIMARY KEY), created_at
 ```
 
 ## Como rodar localmente

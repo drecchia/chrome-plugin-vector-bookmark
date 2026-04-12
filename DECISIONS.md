@@ -133,12 +133,15 @@ DaemonState   { port: number | null, token: string | null }
 - **`incognito: "not_allowed"`**: proteção de privacidade garantida no manifest, não em código.
 - **Opt-in de domínio**: o código em `service-worker.ts` tem comentário de "auto-opt-in" para MVP — o prompt real de confirmação por domínio não está implementado ainda.
 - **Badge de feedback**: ícone pisca vermelho por 2s após ingest — único feedback visual de que a página foi capturada.
+- **Blacklist de domínios do usuário (CR-008/CR-009/CR-010)**: suffix match — `example.com` bloqueia `example.com` e `sub.example.com`. Entradas no formato `/pattern/` são tratadas como regex (`new RegExp(pattern, 'i')`). Armazenada no daemon (tabela `blocklist`); SW faz polling a cada 60s. Migração automática de `chrome.storage.local` na primeira execução. Gerenciamento via aba "Blocklist" em `/ui`; popup tem apenas o atalho "Block this site".
+- **Status da página atual (CR-009)**: endpoint `GET /page?url=<url>` retorna `{"indexed": bool}` usando `PageExists()` no store. Popup consulta via `popup_page_exists` message ao abrir e exibe indicador verde + botão "Remove" se a página está indexada.
+- **Star rank (CR-010)**: `star_rank INTEGER DEFAULT 0` na tabela `pages`. Ingest aceita `starRank: bool`. Na busca, score RRF de páginas com `star_rank=1` é multiplicado por 1.5 antes do sort final. Popup tem botão "⭐" que envia `force_extract` com `starRank: true`. Ambos os botões de indexação ficam desabilitados quando o domínio está na blocklist/denylist.
 
 ⚠️ DECISÕES NÃO CLARAS (revisar):
 
 - **Opt-in por domínio não implementado**: o PRD e o GUIA descrevem confirmação por eTLD+1, mas o código atual faz `setOptIn(domain, true)` automaticamente. Decisão pendente: exibir prompt ou capturar silenciosamente.
 - **Denylist aplicada depois da extração**: o content script extrai o texto antes do SW checar o denylist. Para domínios sensíveis que passarem pela verificação de URL (ex: domínio novo), o texto já foi lido do DOM. Avaliar se a checagem deve acontecer no content script também.
-- **`chrome.storage` não usado para nada**: declarado nas permissões mas sem leitura/escrita no código atual.
+- **`chrome.storage` usado para blacklist e config do daemon**: `vbmBlockedDomains`, `vbmHost`, `vbmPort` persistidos em `chrome.storage.local`.
 - **`idle` permission declarada mas não usada**: `chrome.idle` está nas permissões mas não há chamada no código.
 
 ---

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,12 +36,13 @@ type Page struct {
 
 // IngestRequest holds data for ingesting a page.
 type IngestRequest struct {
-	URL     string
-	Title   string
-	Text    string
-	VisitTs int64
-	DwellMs int64
-	Domain  string
+	URL      string
+	Title    string
+	Text     string
+	VisitTs  int64
+	DwellMs  int64
+	Domain   string
+	StarRank bool
 }
 
 // SearchResult holds a single search hit.
@@ -147,11 +149,33 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("get schema version: %w", err)
 	}
 
+	// schemaV2: upgrade FTS5 to porter stemmer for better BM25 recall.
+	// DROP + recreate is required — FTS5 virtual tables don't support ALTER TABLE.
+	const schemaV2 = `
+DROP TABLE IF EXISTS chunks_fts;
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
+`
+	const schemaV3 = `ALTER TABLE pages ADD COLUMN star_rank INTEGER NOT NULL DEFAULT 0;`
+	const schemaV4 = `
+CREATE TABLE IF NOT EXISTS blocklist (
+    pattern    TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);`
+
 	migrations := []struct {
 		version int
 		sql     string
 	}{
 		{1, schemaV1},
+		{2, schemaV2},
+		{3, schemaV3},
+		{4, schemaV4},
 	}
 
 	for _, m := range migrations {
@@ -192,17 +216,23 @@ func (s *Store) Ingest(req IngestRequest) error {
 	}
 	defer tx.Rollback()
 
+	starRank := 0
+	if req.StarRank {
+		starRank = 1
+	}
+
 	// Upsert page
 	res, err := tx.Exec(`
-		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, star_rank, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(url_hash) DO UPDATE SET
 			title=excluded.title,
 			domain=excluded.domain,
 			visit_ts=excluded.visit_ts,
 			dwell_ms=excluded.dwell_ms,
-			model_ver=excluded.model_ver
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), now)
+			model_ver=excluded.model_ver,
+			star_rank=MAX(star_rank, excluded.star_rank)
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), starRank, now)
 	if err != nil {
 		return fmt.Errorf("upsert page: %w", err)
 	}
@@ -375,7 +405,7 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 	placeholders := strings.Repeat("?,", len(ids))
 	placeholders = placeholders[:len(placeholders)-1]
 	joinQuery := fmt.Sprintf(`
-		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts
+		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts, p.star_rank
 		FROM chunks c JOIN pages p ON c.page_id = p.id
 		WHERE c.id IN (%s)
 	`, placeholders)
@@ -387,17 +417,18 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 
 	// Collect into map to preserve RRF order after JOIN.
 	type rowData struct {
-		text    string
-		url     string
-		title   string
-		domain  string
-		visitTs int64
+		text     string
+		url      string
+		title    string
+		domain   string
+		visitTs  int64
+		starRank int
 	}
 	rowMap := make(map[int64]rowData, len(entries))
 	for joinRows.Next() {
 		var id int64
 		var rd rowData
-		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs); err != nil {
+		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs, &rd.starRank); err != nil {
 			continue
 		}
 		rowMap[id] = rd
@@ -409,6 +440,10 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 		if !ok {
 			continue
 		}
+		score := e.score
+		if rd.starRank == 1 {
+			score *= 1.5 // CR-010: starred pages rank earlier
+		}
 		// P2-05: 400 chars gives better context for technical docs.
 		snippet := rd.text
 		if len(snippet) > 400 {
@@ -419,11 +454,55 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 			Title:   rd.title,
 			Snippet: snippet,
 			VisitTs: rd.visitTs,
-			Score:   e.score,
+			Score:   score,
 			Domain:  rd.domain,
 		})
 	}
+	// Re-sort after star_rank boost may have changed relative order.
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 	return results, nil
+}
+
+// HistoryRow is a raw row returned by GetPageHistoryRows.
+type HistoryRow struct {
+	PageID   int64
+	URL      string
+	Title    string
+	Domain   string
+	VisitTs  int64
+	StarRank int
+	Text     string
+}
+
+// GetPageHistoryRows returns chunk texts for the top `limit` pages visited in
+// [fromMs, toMs), ordered by visit_ts DESC. The caller groups by PageID and
+// extracts keywords per page.
+func (s *Store) GetPageHistoryRows(fromMs, toMs int64, limit int) ([]HistoryRow, error) {
+	rows, err := s.db.Query(`
+		SELECT p.id, p.url, p.title, p.domain, p.visit_ts, p.star_rank, c.text
+		FROM chunks c
+		JOIN pages p ON c.page_id = p.id
+		WHERE p.id IN (
+			SELECT id FROM pages
+			WHERE visit_ts >= ? AND visit_ts < ?
+			ORDER BY visit_ts DESC
+			LIMIT ?
+		)
+		ORDER BY p.visit_ts DESC
+	`, fromMs, toMs, limit)
+	if err != nil {
+		return nil, fmt.Errorf("page history rows: %w", err)
+	}
+	defer rows.Close()
+	var out []HistoryRow
+	for rows.Next() {
+		var r HistoryRow
+		if err := rows.Scan(&r.PageID, &r.URL, &r.Title, &r.Domain, &r.VisitTs, &r.StarRank, &r.Text); err != nil {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func rrf(bm25Ranks, denseRanks map[int64]int, k int) map[int64]float64 {
@@ -435,6 +514,90 @@ func rrf(bm25Ranks, denseRanks map[int64]int, k int) map[int64]float64 {
 		scores[id] += 1.0 / float64(k+rank)
 	}
 	return scores
+}
+
+// GetChunkTextByPeriod returns all chunk texts for pages visited in [fromMs, toMs).
+func (s *Store) GetChunkTextByPeriod(fromMs, toMs int64) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT c.text FROM chunks c
+		JOIN pages p ON c.page_id = p.id
+		WHERE p.visit_ts >= ? AND p.visit_ts < ?
+	`, fromMs, toMs)
+	if err != nil {
+		return nil, fmt.Errorf("chunk text by period: %w", err)
+	}
+	defer rows.Close()
+	var texts []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			continue
+		}
+		texts = append(texts, t)
+	}
+	return texts, nil
+}
+
+// ChunkForReindex holds the minimal data needed to re-embed a chunk.
+type ChunkForReindex struct {
+	ID   int64
+	Text string
+}
+
+// GetChunksForReindex returns all chunks that still carry stub-v0 embeddings.
+func (s *Store) GetChunksForReindex() ([]ChunkForReindex, error) {
+	rows, err := s.db.Query(`SELECT id, text FROM chunks WHERE model_ver = 'stub-v0'`)
+	if err != nil {
+		return nil, fmt.Errorf("get chunks for reindex: %w", err)
+	}
+	defer rows.Close()
+	var chunks []ChunkForReindex
+	for rows.Next() {
+		var c ChunkForReindex
+		if err := rows.Scan(&c.ID, &c.Text); err != nil {
+			continue
+		}
+		chunks = append(chunks, c)
+	}
+	return chunks, nil
+}
+
+// UpdateChunkEmbedding replaces the embedding and model_ver for one chunk.
+func (s *Store) UpdateChunkEmbedding(id int64, vec []float32, modelVer string) error {
+	blob := embed.EncodeEmbedding(vec)
+	_, err := s.db.Exec(`UPDATE chunks SET embedding = ?, model_ver = ? WHERE id = ?`, blob, modelVer, id)
+	return err
+}
+
+// EmbedderVersion returns the active embedder's version string.
+func (s *Store) EmbedderVersion() string { return s.embedder.Version() }
+
+// ReindexChunks re-embeds all stub-v0 chunks using the current embedder.
+// progress is called after each successful update with (done, total).
+// Returns the count of successfully re-embedded chunks.
+func (s *Store) ReindexChunks(progress func(done, total int)) (int, error) {
+	chunks, err := s.GetChunksForReindex()
+	if err != nil {
+		return 0, err
+	}
+	total := len(chunks)
+	done := 0
+	for _, c := range chunks {
+		vec, err := s.embedder.Embed(c.Text)
+		if err != nil {
+			slog.Warn("reindex embed failed", "chunk_id", c.ID, "err", err)
+			continue
+		}
+		if err := s.UpdateChunkEmbedding(c.ID, vec, s.embedder.Version()); err != nil {
+			slog.Warn("reindex update failed", "chunk_id", c.ID, "err", err)
+			continue
+		}
+		done++
+		if progress != nil {
+			progress(done, total)
+		}
+	}
+	return done, nil
 }
 
 // Forget deletes pages (and cascades to chunks) based on type.
@@ -506,6 +669,47 @@ func (s *Store) Cleanup(ttlDays int) (int64, error) {
 		}
 	}
 	return n, nil
+}
+
+// PageExists reports whether a URL has already been indexed.
+func (s *Store) PageExists(rawURL string) (bool, error) {
+	hash := chunk.Hash(rawURL)
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(1) FROM pages WHERE url_hash = ?`, hash).Scan(&n)
+	return n > 0, err
+}
+
+// GetBlocklist returns all patterns in the user-managed domain blocklist.
+func (s *Store) GetBlocklist() ([]string, error) {
+	rows, err := s.db.Query(`SELECT pattern FROM blocklist ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("get blocklist: %w", err)
+	}
+	defer rows.Close()
+	var patterns []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			continue
+		}
+		patterns = append(patterns, p)
+	}
+	return patterns, nil
+}
+
+// AddToBlocklist adds a pattern to the blocklist (idempotent).
+func (s *Store) AddToBlocklist(pattern string) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO blocklist (pattern, created_at) VALUES (?, ?)`,
+		pattern, time.Now().UnixMilli(),
+	)
+	return err
+}
+
+// RemoveFromBlocklist removes a pattern from the blocklist.
+func (s *Store) RemoveFromBlocklist(pattern string) error {
+	_, err := s.db.Exec(`DELETE FROM blocklist WHERE pattern = ?`, pattern)
+	return err
 }
 
 // GetStatus returns the number of indexed pages and pending queue items.

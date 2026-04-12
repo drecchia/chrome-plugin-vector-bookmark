@@ -7,6 +7,8 @@ export interface IngestRequest {
 	visitTs: number;
 	dwellMs: number;
 	domain: string;
+	/** If true, page is marked as a reference (1.5× search score boost). */
+	starRank?: boolean;
 }
 
 // ---- Search ----
@@ -46,6 +48,8 @@ export interface StatusResponse {
 	version: string;
 	daemonPort: number | null;
 	captureEnabled: boolean;
+	/** 'stub-v0' means semantic search is disabled (BM25-only) */
+	embedderVersion: string;
 }
 
 // ---- WebSocket push ----

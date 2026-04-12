@@ -2,7 +2,7 @@
 
 Runbook para quem **opera** ou **integra** o Vector Bookmark. Para guia de usuário final, veja `docs/GUIA.md`.
 
-Este documento cobre variáveis de ambiente, setup de busca semântica real (Ollama), retenção de dados (LGPD), observabilidade com Prometheus, logs estruturados e troubleshooting.
+Este documento cobre variáveis de ambiente, setup de busca semântica real (OpenRouter ou Ollama), retenção de dados (LGPD), observabilidade com Prometheus, logs estruturados e troubleshooting.
 
 ---
 
@@ -15,7 +15,7 @@ Este documento cobre variáveis de ambiente, setup de busca semântica real (Oll
 | Go | 1.22+ | Apenas para build — runtime é estático |
 | Node.js | 20+ | Build da extensão |
 | Chrome/Chromium | estável | Manifest V3 |
-| Ollama *(opcional)* | 0.1.x+ | Para busca semântica real; sem ele o daemon usa `StubEmbedder` (zeros) |
+| Embedder *(opcional)* | — | OpenRouter (cloud, sem GPU) ou Ollama (local, CPU ok). Sem config usa `StubEmbedder` (zeros). |
 
 ---
 
@@ -63,8 +63,10 @@ Todas as variáveis são lidas no startup do daemon (`daemon/internal/server/ser
 |---|---|---|---|
 | `VBM_PORT` | `7532` | Não | Porta de escuta. Override via env ou `~/.config/vbm/env`. Atualizar no popup se mudar. |
 | `VBM_BIND` | `127.0.0.1` | Não | Interface de bind. **Nunca usar `0.0.0.0`** em host compartilhado. Apenas Docker com rede isolada deve alterar. |
-| `VBM_EMBED_URL` | *(vazio → stub)* | Opcional | Endpoint Ollama-compat. Sem ele, `StubEmbedder` produz vetores zero e a busca cai para BM25 puro. |
-| `VBM_EMBED_MODEL` | `nomic-embed-text` | Não | Modelo de embedding usado nas requests ao Ollama. |
+| `VBM_EMBED_URL` | *(vazio → stub)* | Opcional | Endpoint de embeddings. Sem ele, `StubEmbedder` produz vetores zero e a busca cai para BM25 puro. |
+| `VBM_EMBED_FORMAT` | `ollama` | Não | `openai` para usar formato OpenAI-compatible (`{"input":...}`) — necessário para OpenRouter/OpenAI. Setado automaticamente se `VBM_EMBED_API_KEY` estiver presente. |
+| `VBM_EMBED_MODEL` | `nomic-embed-text` | Não | Nome do modelo. OpenRouter: `openai/text-embedding-3-small`. Ollama: `nomic-embed-text`. |
+| `VBM_EMBED_API_KEY` | *(vazio)* | Condicional | API key para OpenRouter ou OpenAI. Vazio para Ollama local. |
 | `VBM_TTL_DAYS` | *(sem retenção)* | Recomendada | Retenção LGPD: páginas com `visit_ts` mais antigo que N dias são removidas por um ticker 24h. |
 | `VBM_LOG_LEVEL` | `info` | Não | `debug` / `info` / `warn` / `error`. Handler é slog JSON em stderr. |
 | `VBM_CORS_ORIGIN` | *(vazio)* | Condicional | CSV de origens extras (além de `chrome-extension://*`) aceitas para requisições HTTP. Necessário para dashboards externos. |
@@ -87,8 +89,16 @@ nano ~/.config/vbm/env
 ```
 
 ```ini
-VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-VBM_EMBED_MODEL=nomic-embed-text
+# Opção A — OpenRouter (sem GPU, requer API key)
+VBM_EMBED_URL=https://openrouter.ai/api/v1/embeddings
+VBM_EMBED_FORMAT=openai
+VBM_EMBED_API_KEY=sk-or-xxxxxxxxxxxx
+VBM_EMBED_MODEL=openai/text-embedding-3-small
+
+# Opção B — Ollama local (sem API key, CPU ok)
+# VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+# VBM_EMBED_MODEL=nomic-embed-text
+
 VBM_TTL_DAYS=90
 VBM_LOG_LEVEL=info
 VBM_CORS_ORIGIN=http://localhost:3000,http://localhost:8080
@@ -108,8 +118,16 @@ notepad "$env:APPDATA\vbm\env"
 ```
 
 ```ini
-VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-VBM_EMBED_MODEL=nomic-embed-text
+# Opção A — OpenRouter
+VBM_EMBED_URL=https://openrouter.ai/api/v1/embeddings
+VBM_EMBED_FORMAT=openai
+VBM_EMBED_API_KEY=sk-or-xxxxxxxxxxxx
+VBM_EMBED_MODEL=openai/text-embedding-3-small
+
+# Opção B — Ollama local
+# VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+# VBM_EMBED_MODEL=nomic-embed-text
+
 VBM_TTL_DAYS=90
 VBM_LOG_LEVEL=info
 VBM_CORS_ORIGIN=http://localhost:3000
@@ -124,81 +142,99 @@ Start-Process -FilePath "$env:LOCALAPPDATA\vbm\vbmd.exe" -ArgumentList "server" 
 
 ---
 
-## 4. Setup de busca semântica com Ollama
+## 4. Setup de busca semântica
 
-Sem `VBM_EMBED_URL`, o daemon usa `StubEmbedder` (vetores zero) e a busca fica dependente só de BM25 FTS5. Para ativar a fusão real BM25 + cosine:
+Sem `VBM_EMBED_URL`, o daemon usa `StubEmbedder` (vetores zero) — busca cai para BM25 puro (palavras exatas). Para ativar fusão BM25 + cosine há duas opções:
 
-### 4.1 Instalar Ollama
+| | OpenRouter | Ollama |
+|---|---|---|
+| GPU necessária | Não | Não (CPU ok) |
+| Privacidade | Texto enviado para API externa | 100% local |
+| Modelo sugerido | `openai/text-embedding-3-small` | `nomic-embed-text` |
+| Custo | ~$0.02 / 1M tokens | Gratuito |
+
+### 4.1 Opção A — OpenRouter (sem GPU, sem Ollama)
 
 ```bash
-# Linux — instalador oficial
+mkdir -p ~/.config/vbm
+cat >> ~/.config/vbm/env <<'EOF'
+VBM_EMBED_URL=https://openrouter.ai/api/v1/embeddings
+VBM_EMBED_FORMAT=openai
+VBM_EMBED_API_KEY=sk-or-xxxxxxxxxxxx
+VBM_EMBED_MODEL=openai/text-embedding-3-small
+EOF
+systemctl --user restart vbmd
+```
+
+Obter API key em https://openrouter.ai → API Keys. Tier gratuito disponível.
+
+### 4.2 Opção B — Ollama (100% local, CPU ok)
+
+```bash
+# Instalar e baixar modelo
 curl -fsSL https://ollama.com/install.sh | sh
+ollama pull nomic-embed-text   # 274 MB, 768d
 
-# Garantir que o serviço está rodando
-systemctl status ollama            # serviço system-wide
-# ou
-ollama serve &                      # foreground para teste
-```
-
-### 4.2 Baixar o modelo de embedding
-
-```bash
-ollama pull nomic-embed-text        # 274 MB, 768 dimensões
-```
-
-Modelos alternativos suportados (contanto que exponham `/api/embeddings`):
-- `mxbai-embed-large` — 669 MB, 1024d (maior qualidade, mais lento)
-- `all-minilm` — 23 MB, 384d (leve, menor qualidade)
-
-### 4.3 Configurar o daemon
-
-```bash
 mkdir -p ~/.config/vbm
 cat >> ~/.config/vbm/env <<'EOF'
 VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
 VBM_EMBED_MODEL=nomic-embed-text
 EOF
-
 systemctl --user restart vbmd
 ```
 
-### 4.4 Formato do protocolo
+Modelos alternativos: `mxbai-embed-large` (669 MB, 1024d), `all-minilm` (23 MB, 384d).
 
-O `HttpEmbedder` faz POST ao endpoint configurado com:
+### 4.3 Formatos de protocolo
+
+**OpenRouter / OpenAI (`VBM_EMBED_FORMAT=openai`):**
 
 ```json
-{
-  "model": "nomic-embed-text",
-  "prompt": "texto a ser vetorizado"
-}
+// Request body
+{ "model": "openai/text-embedding-3-small", "input": "texto" }
+// Response
+{ "data": [{ "embedding": [0.123, -0.456, ...] }] }
 ```
 
-E espera resposta:
+**Ollama (formato padrão):**
 
 ```json
+// Request body
+{ "model": "nomic-embed-text", "prompt": "texto" }
+// Response
 { "embedding": [0.123, -0.456, ...] }
 ```
 
-Timeout do cliente: **10s**. Se o modelo escolhido demora mais que isso, o chunk entra no banco com vetor zero e a busca degrada para BM25 puro nesse documento.
+Timeout: **30s** (OpenAI) / **10s** (Ollama).
+
+### 4.4 Re-embedar páginas já indexadas
+
+Páginas capturadas antes da configuração têm `model_ver='stub-v0'` (vetores zero). Para re-embedá-las:
+
+**Via popup da extensão:** botão **"Re-embed pages (semantic search)"** — exibido quando há páginas indexadas. Mostra progresso `N/M` em tempo real.
+
+**Via curl:**
+
+```bash
+curl -s -X POST http://127.0.0.1:7532/admin/reindex
+# → {"started":true}
+
+# Acompanhar progresso
+curl -s http://127.0.0.1:7532/admin/reindex/status
+# → {"running":true,"done":42,"total":150}
+# → {"running":false,"done":150,"total":150}
+```
 
 ### 4.5 Verificar
 
 ```bash
-# Forçar ingest manual (via curl) ou aguardar captura real
-# Depois:
-curl -s "http://127.0.0.1:7532/search?q=termo+semantico&limit=5" | jq
-```
+# Confirmar model_ver nos chunks
+sqlite3 ~/.local/share/vbm/vbm.db \
+  "SELECT model_ver, count(*) FROM chunks GROUP BY model_ver;"
+# openai-v0 ou http-v0 = embeddings reais; stub-v0 = ainda pendente
 
-Se o campo `score` dos resultados varia entre documentos, a busca vetorial está ativa. Se todos retornam score idêntico, o `StubEmbedder` ainda está em uso — checar `journalctl --user -u vbmd | grep embed`.
-
-### 4.6 Migração de modelo
-
-Mudar `VBM_EMBED_MODEL` não re-vetoriza os chunks antigos — o campo `model_ver` em cada chunk preserva a versão original. Re-vetorização futura está planejada via ferramenta offline; por ora, para trocar modelo com vetores consistentes:
-
-```bash
-systemctl --user stop vbmd
-rm ~/.local/share/vbm/vbm.db       # ⚠️ apaga histórico
-systemctl --user start vbmd
+# Testar busca semântica
+curl -s "http://127.0.0.1:7532/search?q=seguranca+hackers&limit=5" | jq
 ```
 
 ---
@@ -395,8 +431,12 @@ Se usar porta diferente de 7532, abrir popup da extensão → seção **Daemon**
 
 ### 8.3 Busca retorna sempre os mesmos resultados
 
-- Se `VBM_EMBED_URL` ausente → busca puramente BM25, scores idênticos em queries curtas. Configurar Ollama (§4).
-- Se embeddings presentes mas scores iguais → verificar `model_ver` dos chunks: `sqlite3 ~/.local/share/vbm/vbm.db "SELECT DISTINCT model_ver FROM chunks"`. Se todos são `stub-v0`, a ingestão aconteceu sem Ollama — apagar DB ou esperar re-ingest.
+- Se `VBM_EMBED_URL` ausente → busca puramente BM25, scores idênticos em queries curtas. Configurar embedder (§4).
+- Se embeddings presentes mas scores iguais → verificar `model_ver`:
+  ```bash
+  sqlite3 ~/.local/share/vbm/vbm.db "SELECT DISTINCT model_ver FROM chunks"
+  ```
+  Se todos são `stub-v0`, ingestão aconteceu sem embedder real — usar botão **"Re-embed pages"** no popup ou `POST /admin/reindex` (§4.4).
 
 ### 8.4 Dashboard externo recebe CORS error
 

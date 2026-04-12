@@ -28,14 +28,24 @@ func Run() error {
 		return fmt.Errorf("data dir: %w", err)
 	}
 
-	// P0-02: select embedder based on VBM_EMBED_URL.
+	// Select embedder based on VBM_EMBED_URL / VBM_EMBED_FORMAT / VBM_EMBED_API_KEY.
+	// VBM_EMBED_FORMAT=openai (or any non-empty VBM_EMBED_API_KEY) → OpenAI-compatible
+	// (works with OpenRouter, OpenAI, Ollama /v1/embeddings).
+	// Default format=ollama → Ollama native API (/api/embeddings).
 	var embedder embed.Embedder = embed.NewStubEmbedder()
 	if u := os.Getenv("VBM_EMBED_URL"); u != "" {
 		model := os.Getenv("VBM_EMBED_MODEL")
-		embedder = embed.NewHttpEmbedder(u, model)
-		slog.Info("using HTTP embedder", "url", u, "model", model)
+		apiKey := os.Getenv("VBM_EMBED_API_KEY")
+		format := os.Getenv("VBM_EMBED_FORMAT")
+		if apiKey != "" || format == "openai" {
+			embedder = embed.NewOpenAIEmbedder(u, model, apiKey)
+			slog.Info("using OpenAI-compatible embedder", "url", u, "model", model)
+		} else {
+			embedder = embed.NewHttpEmbedder(u, model)
+			slog.Info("using Ollama embedder", "url", u, "model", model)
+		}
 	} else {
-		slog.Warn("VBM_EMBED_URL not set, using stub embedder (BM25-only, no semantic search)")
+		slog.Warn("VBM_EMBED_URL not set — using stub embedder (BM25-only, no semantic search)")
 	}
 
 	s, err := store.New(dataDir, embedder)

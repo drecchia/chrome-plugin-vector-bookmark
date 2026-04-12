@@ -188,18 +188,30 @@ rm -rf ~/.local/share/vbm/
 
 ## Busca semântica com embeddings
 
-Por padrão, o daemon usa um **embedder stub** que produz vetores zero — a busca funciona, mas usa apenas BM25 (casamento textual). Para ativar a busca semântica real (encontrar "artigo sobre paralelismo em Rust" mesmo sem as palavras exatas), configure um modelo de embedding local via **Ollama**.
+Por padrão, o daemon usa um **embedder stub** (vetores zero) — a busca usa apenas BM25 (palavras exatas). Para ativar busca semântica real (encontrar "artigo sobre segurança com IA" buscando por "hacker" ou "pentest"), configure um embedder.
 
-### Setup rápido
+**Não precisa de GPU.** Duas opções:
+
+### Opção A — OpenRouter (mais fácil, sem instalar nada)
 
 ```bash
-# 1. Instalar Ollama
+mkdir -p ~/.config/vbm
+cat >> ~/.config/vbm/env <<'EOF'
+VBM_EMBED_URL=https://openrouter.ai/api/v1/embeddings
+VBM_EMBED_FORMAT=openai
+VBM_EMBED_API_KEY=sk-or-xxxxxxxxxxxx
+VBM_EMBED_MODEL=openai/text-embedding-3-small
+EOF
+systemctl --user restart vbmd
+```
+
+Obter API key gratuita em https://openrouter.ai.
+
+### Opção B — Ollama (100% local, nenhum dado sai da máquina)
+
+```bash
 curl -fsSL https://ollama.com/install.sh | sh
-
-# 2. Baixar modelo (274 MB, 768 dimensões, rápido)
 ollama pull nomic-embed-text
-
-# 3. Apontar o daemon para Ollama
 mkdir -p ~/.config/vbm
 cat >> ~/.config/vbm/env <<'EOF'
 VBM_EMBED_URL=http://127.0.0.1:11434/api/embeddings
@@ -208,9 +220,11 @@ EOF
 systemctl --user restart vbmd
 ```
 
-Novas páginas capturadas já nascem com embeddings reais. Páginas capturadas antes continuam com vetores stub (o campo `model_ver` preserva a versão) — para re-vetorizar tudo, apague `~/.local/share/vbm/vbm.db` e re-capture.
+### Re-embedar páginas já capturadas
 
-Para detalhes (modelos alternativos, migração, troubleshooting do embedder), veja `docs/OPERATIONS.md §4`.
+Páginas indexadas antes da configuração ficam sem embedding real. Clique no botão **"Re-embed pages (semantic search)"** no popup da extensão — ele aparece quando há páginas indexadas e mostra progresso em tempo real.
+
+Para detalhes (modelos alternativos, curl, troubleshooting), veja `docs/OPERATIONS.md §4`.
 
 ---
 
@@ -273,9 +287,15 @@ Clique no ícone da extensão na barra do Chrome para:
 
 | Ação | O que faz |
 |---|---|
-| **Pausar** | Suspende a captura por 1 hora, 1 dia ou indefinidamente |
+| **Pausar / Retomar** | Suspende ou retoma a captura passiva |
+| **Index this page now** | Força indexação imediata da aba atual (sem esperar 30s) |
+| **Re-embed pages** | Re-embeda páginas já indexadas com o embedder ativo (busca semântica) |
 | **Esquecer URL** | Remove uma página específica do índice |
 | **Esquecer domínio** | Remove todas as páginas de um site |
+| **✓ This page is indexed** | Indicador verde quando a página atual já está no índice; botão "Remove" apaga a página |
+| **⭐ (botão estrela)** | Indexa a página com `star_rank=1` — aparece antes nos resultados de busca (boost 1.5×) |
+| **Index this page now / ⭐** | Desabilitados quando o domínio está na blocklist ou no denylist estático |
+| **Block this site** | Bloqueia o domínio da aba atual via daemon; gerenciamento completo em Open UI → Blocklist |
 | **Abrir UI completa** | Abre `http://127.0.0.1:PORTA/ui` no navegador |
 
 ---
@@ -297,6 +317,7 @@ A extensão bloqueia automaticamente:
 - Campos com senha ou cartão de crédito — captura pausada enquanto focado
 - Domínios sensíveis: bancos, `.gov`, `.mil`, portais de saúde, gerenciadores de senha (1Password, Bitwarden, etc.), webmail (Gmail, Outlook)
 - URLs com `/login`, `/checkout`, `/payment`, `/password`, `/auth/`
+- Domínios na **blacklist do usuário** — adicionados via popup (seção "Blocked sites"); usa suffix match, então `example.com` também bloqueia `sub.example.com`
 
 Na primeira visita a qualquer domínio, a extensão pede confirmação antes de capturar.
 
@@ -306,7 +327,7 @@ Na primeira visita a qualquer domínio, a extensão pede confirmação antes de 
 
 - **Local first**: todos os dados ficam em `~/.local/share/vbm/` na sua máquina
 - **Sem telemetria**: nenhuma chamada externa é feita (v0.1)
-- **Sem LLM externo**: a busca usa modelos locais; nenhum texto é enviado ao OpenAI, Anthropic ou similar
+- **Sem LLM externo por padrão**: com `StubEmbedder` ou Ollama, nenhum texto sai da máquina. Se usar OpenRouter (`VBM_EMBED_API_KEY`), chunks de texto são enviados à API para gerar embeddings
 - **Comunicação segura**: o daemon só aceita conexões de `127.0.0.1` (bind exclusivo em loopback)
 - **Direito ao esquecimento**: use o popup ou a UI local para apagar qualquer página, domínio ou intervalo de tempo; a remoção é física (não apenas soft-delete)
 
@@ -320,7 +341,7 @@ Na primeira visita a qualquer domínio, a extensão pede confirmação antes de 
 ### FAQ de Privacidade
 
 **Algum dado é enviado para servidores externos?**
-Não. Em v0.1, toda a stack roda em `127.0.0.1` (bind exclusivo em loopback). Não há telemetria, analytics, ou chamadas a APIs externas. Se você configurar `VBM_EMBED_URL` apontando para Ollama local, o texto dos seus chunks sai do daemon mas só para outro processo na mesma máquina.
+Depende do embedder. O daemon em si não tem telemetria e faz bind exclusivo em `127.0.0.1`. Se você usar **Ollama** ou o stub padrão, nenhum dado sai da máquina. Se usar **OpenRouter** (`VBM_EMBED_API_KEY`), o texto dos chunks é enviado à API do OpenRouter para gerar embeddings — o conteúdo das páginas que você leu é transmitido. Escolha Ollama se isso for uma preocupação.
 
 **E se eu abrir uma página sensível (banco, login, CPF, saúde)?**
 Três camadas de proteção:

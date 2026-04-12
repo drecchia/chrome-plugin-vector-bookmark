@@ -26,3 +26,13 @@ export async function saveDaemonConfig(
 export function getDaemonBase(config: DaemonConfig): string {
 	return `http://${config.host}:${config.port}`;
 }
+
+/** Normalise a domain/pattern for the daemon blocklist.
+ *  - Regex entries (/pattern/) stored as-is.
+ *  - Plain domains: strip leading "*." and lowercase.
+ */
+export function normaliseBlocklistEntry(raw: string): string {
+	const trimmed = raw.trim();
+	if (trimmed.startsWith('/') && trimmed.endsWith('/')) return trimmed;
+	return trimmed.replace(/^\*\./, '').toLowerCase();
+}

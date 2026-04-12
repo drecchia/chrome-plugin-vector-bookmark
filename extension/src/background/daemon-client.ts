@@ -49,6 +49,7 @@ export async function getStatus(): Promise<{
 	pending: number;
 	version: string;
 	port: number;
+	embedderVersion: string;
 }> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/status`);
@@ -57,8 +58,13 @@ export async function getStatus(): Promise<{
 		indexed: number;
 		pending: number;
 		version: string;
+		embedder_version: string;
 	};
-	return { ...data, port: cfg.port };
+	return {
+		...data,
+		port: cfg.port,
+		embedderVersion: data.embedder_version ?? 'stub-v0',
+	};
 }
 
 export async function healthz(): Promise<boolean> {
@@ -69,4 +75,74 @@ export async function healthz(): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+export async function pageExists(url: string): Promise<boolean> {
+	try {
+		const cfg = await getDaemonConfig();
+		const params = new URLSearchParams({ url });
+		const res = await fetch(`${getDaemonBase(cfg)}/page?${params}`);
+		if (!res.ok) return false;
+		const data = (await res.json()) as { indexed: boolean };
+		return data.indexed;
+	} catch {
+		return false;
+	}
+}
+
+export async function getBlocklist(): Promise<string[]> {
+	try {
+		const cfg = await getDaemonConfig();
+		const res = await fetch(`${getDaemonBase(cfg)}/blocklist`);
+		if (!res.ok) return [];
+		const data = (await res.json()) as { patterns: string[] };
+		return data.patterns ?? [];
+	} catch {
+		return [];
+	}
+}
+
+export async function addToBlocklist(pattern: string): Promise<void> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/blocklist`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ pattern }),
+	});
+	await checkResponse(res);
+}
+
+export async function removeFromBlocklist(pattern: string): Promise<void> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/blocklist`, {
+		method: 'DELETE',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ pattern }),
+	});
+	await checkResponse(res);
+}
+
+export async function reindex(): Promise<{ started: boolean }> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex`, {
+		method: 'POST',
+	});
+	if (res.status === 409) return { started: false }; // already running
+	await checkResponse(res);
+	return res.json() as Promise<{ started: boolean }>;
+}
+
+export async function getReindexStatus(): Promise<{
+	running: boolean;
+	done: number;
+	total: number;
+}> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex/status`);
+	await checkResponse(res);
+	return res.json() as Promise<{
+		running: boolean;
+		done: number;
+		total: number;
+	}>;
 }
