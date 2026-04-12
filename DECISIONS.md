@@ -147,12 +147,9 @@ DaemonState   { port: number | null, token: string | null }
 
 **Decisões observadas:**
 
-- **Híbrido NM + HTTP**: Native Messaging apenas para handshake (descoberta de porta + token). Dados trafegam via HTTP — evita o limite de 1MB/mensagem do NM.
-- **Token rotaciona por restart, não por sessão do browser**: mesma sessão do Chrome após restart do daemon exige novo handshake (automático via `connectDaemon()`).
+- **HTTP direto (sem Native Messaging)**: extensão conecta diretamente em `http://127.0.0.1:7532` (porta padrão). Sem handshake NM, sem token de sessão, sem manifesto de NM host. Porta e host configuráveis pelo usuário no popup → `chrome.storage.local`.
+- **Porta padrão 7532**: daemon escuta em `127.0.0.1:7532` por default; override via `VBM_PORT`. Se mudado, usuário atualiza no popup.
+- **Sem autenticação por token**: segurança é o bind exclusivo em `127.0.0.1` — apenas processos locais conseguem conectar. Token de sessão removido em CR-008.
+- **CORS configurável**: `chrome-extension://` aceito por padrão. Origens extras via `VBM_CORS_ORIGIN` (CSV).
 - **Sem mTLS, sem TLS**: canal local, sem criptografia. Aceitável para loopback; não aceitável se daemon eventualmente expor rede.
 - **WebSocket push unidirecional**: daemon envia status a cada 5s; extensão não envia comandos via WS.
-
-⚠️ DECISÕES NÃO CLARAS (revisar):
-
-- `DaemonState.token` tipado como `number | null` em `proto/types.ts` mas deveria ser `string | null` — bug de tipo no arquivo de protocolo.
-- O NM manifest usa `EXTENSION_ID` como placeholder substituído pelo `install.sh` — se o usuário recarregar a extensão (novo ID), precisa rodar o instalador novamente. Sem mecanismo de auto-atualização.

@@ -77,8 +77,6 @@ make install
 
 O instalador vai:
 - Copiar o binário para `~/.local/bin/vbmd`
-- Perguntar o ID da extensão que você copiou no passo anterior
-- Instalar o manifesto de Native Messaging em `~/.config/google-chrome/NativeMessagingHosts/`
 - Registrar e iniciar o serviço systemd do usuário
 
 #### 5. Verificar a instalação
@@ -87,13 +85,12 @@ O instalador vai:
 # Ver status do daemon
 systemctl --user status vbmd
 
-# Testar endpoint de saúde
-PORT=$(python3 -c "import json; print(json.load(open('$HOME/.local/share/vbm/session.json'))['port'])")
-curl http://127.0.0.1:$PORT/healthz
+# Testar endpoint de saúde (porta padrão 7532)
+curl http://127.0.0.1:7532/healthz
 # Esperado: {"ok":true}
 ```
 
-No Chrome, o ícone da extensão deve aparecer na barra. Clique nele — deve mostrar **"Conectado ao daemon"**.
+No Chrome, o ícone da extensão deve aparecer na barra. Clique nele — deve mostrar o contador de páginas indexadas.
 
 ---
 
@@ -123,47 +120,7 @@ npm run build
 3. **Carregar sem compactação** → selecione `extension/dist/`
 4. Copie o **ID da extensão**
 
-#### 3. Instalar o Native Messaging host no host
-
-O Chrome precisa de um binário `vbmd` no host para fazer o handshake inicial (descoberta de porta e token). Com Docker, o container escreve o `session.json` e o binário NM host lê esse arquivo.
-
-**a) Baixe ou compile apenas o binário NM host:**
-
-```bash
-cd daemon
-go build -o bin/vbmd ./cmd/vbmd/
-install -Dm755 bin/vbmd ~/.local/bin/vbmd
-```
-
-Ou, se não quiser Go na máquina, copie o binário de dentro do container após o build:
-
-```bash
-docker compose build
-docker create --name vbmd-tmp vbmd
-docker cp vbmd-tmp:/usr/local/bin/vbmd ~/.local/bin/vbmd
-docker rm vbmd-tmp
-```
-
-**b) Instalar o manifesto de Native Messaging:**
-
-```bash
-mkdir -p ~/.config/google-chrome/NativeMessagingHosts
-cat > ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json <<EOF
-{
-  "name": "com.vbm.daemon",
-  "description": "Vector Bookmark native daemon bridge",
-  "path": "$HOME/.local/bin/vbmd",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://SEU_EXTENSION_ID/"
-  ]
-}
-EOF
-```
-
-Substitua `SEU_EXTENSION_ID` pelo ID copiado no passo 2.
-
-#### 4. Subir o daemon com Docker Compose
+#### 3. Subir o daemon com Docker Compose
 
 ```bash
 # Na raiz do projeto
@@ -171,10 +128,9 @@ docker compose up -d
 ```
 
 O que acontece:
-- Container sobe o `vbmd server` na porta `7532` internamente
+- Container sobe o `vbmd server` na porta `7532`
 - Docker expõe exclusivamente `127.0.0.1:7532` no host (loopback apenas)
-- O daemon escreve `~/.local/share/vbm/session.json` via volume compartilhado
-- Quando o Chrome chamar o binário `vbmd nm-host`, ele lê o `session.json` e retorna `{port: 7532, token: "..."}` para a extensão
+- A extensão conecta diretamente em `127.0.0.1:7532`
 
 #### 5. Verificar
 
@@ -221,8 +177,8 @@ rm -rf ~/.local/share/vbm/
 
 | Aspecto | Nativa | Docker |
 |---|---|---|
-| Dependência de Go | Sim (build) | Não (opcional para NM host) |
-| Porta do daemon | Aleatória | Fixa em `7532` |
+| Dependência de Go | Sim (build) | Não |
+| Porta do daemon | `7532` (padrão) | `7532` (fixo) |
 | Isolamento | systemd user | Container Docker |
 | Auto-start | `systemctl --user enable` | `restart: unless-stopped` |
 | Logs | `journalctl --user -u vbmd` | `docker compose logs -f` |
@@ -351,15 +307,14 @@ Na primeira visita a qualquer domínio, a extensão pede confirmação antes de 
 - **Local first**: todos os dados ficam em `~/.local/share/vbm/` na sua máquina
 - **Sem telemetria**: nenhuma chamada externa é feita (v0.1)
 - **Sem LLM externo**: a busca usa modelos locais; nenhum texto é enviado ao OpenAI, Anthropic ou similar
-- **Comunicação segura**: o daemon só aceita conexões de `127.0.0.1` e valida um token de sessão gerado a cada reinicialização
+- **Comunicação segura**: o daemon só aceita conexões de `127.0.0.1` (bind exclusivo em loopback)
 - **Direito ao esquecimento**: use o popup ou a UI local para apagar qualquer página, domínio ou intervalo de tempo; a remoção é física (não apenas soft-delete)
 
 ### Onde os dados ficam
 
 ```
 ~/.local/share/vbm/
-├── vbm.db          # banco SQLite com chunks, embeddings e metadados
-└── session.json    # porta e token da sessão atual (chmod 600)
+└── vbm.db          # banco SQLite com chunks, embeddings e metadados
 ```
 
 ### FAQ de Privacidade
@@ -391,10 +346,7 @@ Indefinidamente por padrão. Para retenção automática (LGPD-friendly), config
 cp ~/.local/share/vbm/vbm.db ~/backup-$(date +%F).db
 
 # Exportação estruturada via API (JSON, sem embeddings)
-PORT=$(jq -r .port ~/.local/share/vbm/session.json)
-TOKEN=$(jq -r .token ~/.local/share/vbm/session.json)
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:$PORT/export" > export.json
+curl -s "http://127.0.0.1:7532/export" > export.json
 ```
 
 **Outro usuário na mesma máquina consegue ler meus dados?**
@@ -412,7 +364,7 @@ cd daemon
 make uninstall
 ```
 
-Isso remove o binário, o serviço systemd e o manifesto de Native Messaging.
+Isso remove o binário e o serviço systemd.
 
 Os dados em `~/.local/share/vbm/` **não são removidos** automaticamente. Para apagar tudo:
 
@@ -424,7 +376,7 @@ rm -rf ~/.local/share/vbm/
 
 ## Solução de problemas
 
-### Popup mostra "Daemon não conectado"
+### Popup mostra erro de conexão
 
 ```bash
 # 1. Verificar se o daemon está rodando
@@ -433,12 +385,14 @@ systemctl --user status vbmd
 # 2. Se parado, iniciar
 systemctl --user start vbmd
 
-# 3. Verificar logs
-journalctl --user -u vbmd -n 50
+# 3. Testar conectividade (porta padrão 7532)
+curl http://127.0.0.1:7532/healthz
 
-# 4. Confirmar que o ID da extensão está correto no manifesto NM
-cat ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json
+# 4. Verificar logs
+journalctl --user -u vbmd -n 50
 ```
+
+Se usar porta customizada, abra o popup da extensão → seção **Daemon** → ajuste o campo de porta.
 
 ### Busca não retorna resultados
 
@@ -446,14 +400,6 @@ cat ~/.config/google-chrome/NativeMessagingHosts/com.vbm.daemon.json
 - Confirme que o domínio foi aceito na lista de opt-in (popup → status do domínio)
 - Aguarde pelo menos 30s em uma página antes de tentar buscar
 - Verifique quantas páginas foram indexadas: popup → contador de páginas
-
-### Erro de permissão no manifesto NM
-
-```bash
-# Reinstalar o manifesto com o ID correto
-cd daemon
-EXTENSION_ID=seu_id_aqui bash install/install.sh
-```
 
 ### Daemon não inicia após reboot
 
@@ -489,3 +435,5 @@ sudo loginctl enable-linger $USER
 | Ver logs do daemon | `journalctl --user -u vbmd -f` |
 | Reiniciar daemon | `systemctl --user restart vbmd` |
 | Ver status | `systemctl --user status vbmd` |
+| Testar daemon | `curl http://127.0.0.1:7532/healthz` |
+| Configurar porta | Popup → seção Daemon |

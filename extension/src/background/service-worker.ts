@@ -1,5 +1,4 @@
 import { ingest, search, getStatus, forget } from './daemon-client';
-import { daemonState } from './native-bridge';
 import { isDeniedUrl, isDeniedDomain } from '../lib/denylist';
 
 interface ForgetRequest {
@@ -123,10 +122,11 @@ chrome.runtime.onMessage.addListener(
 		if (msg.type === 'popup_status') {
 			getStatus()
 				.then((status) =>
-					// P1-02: include daemon port so popup can build correct UI URL.
 					sendResponse({
-						...status,
-						daemonPort: daemonState.port,
+						indexed: status.indexed,
+						pending: status.pending,
+						version: status.version,
+						daemonPort: status.port,
 						captureEnabled,
 					}),
 				)

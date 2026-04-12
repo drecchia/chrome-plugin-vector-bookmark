@@ -29,11 +29,6 @@ func main() {
 	}
 
 	switch mode {
-	case "nm-host", "--nm-host":
-		if err := nm.RunHost(); err != nil {
-			fmt.Fprintf(os.Stderr, "nm-host error: %v\n", err)
-			os.Exit(1)
-		}
 	case "server":
 		// P1-13: structured JSON logs. Level controlled by VBM_LOG_LEVEL.
 		logLevel := slog.LevelInfo
@@ -51,7 +46,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: vbmd [server|nm-host]\n")
+		fmt.Fprintf(os.Stderr, "Usage: vbmd [server]\n")
 		os.Exit(1)
 	}
 }

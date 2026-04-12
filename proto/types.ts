@@ -55,27 +55,8 @@ export interface WsStatusMessage {
 	pending: number;
 }
 
-// ---- Native Messaging ----
-export interface NMHandshakeRequest {
-	type: 'handshake';
-	extensionId: string;
-}
-
-export interface NMHandshakeOk {
-	type: 'handshake_ok';
-	port: number;
-	token: string;
-}
-
-export interface NMHandshakeError {
-	type: 'handshake_error';
-	error: string;
-}
-
-export type NMResponse = NMHandshakeOk | NMHandshakeError;
-
-// ---- Daemon connection state ----
+// ---- Daemon connection config ----
 export interface DaemonState {
-	port: number | null;
-	token: string | null;
+	host: string;
+	port: number;
 }

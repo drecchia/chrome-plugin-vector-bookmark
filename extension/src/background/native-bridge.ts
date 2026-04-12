@@ -1,66 +1,28 @@
-interface NMHandshakeResponse {
-	type: 'handshake_ok';
+export const DEFAULT_HOST = '127.0.0.1';
+export const DEFAULT_PORT = 7532;
+
+export interface DaemonConfig {
+	host: string;
 	port: number;
-	token: string;
 }
 
-export interface DaemonState {
-	port: number | null;
-	token: string | null;
+export async function getDaemonConfig(): Promise<DaemonConfig> {
+	const result = await chrome.storage.local.get(['vbmHost', 'vbmPort']);
+	return {
+		host: (result.vbmHost as string) || DEFAULT_HOST,
+		port: (result.vbmPort as number) || DEFAULT_PORT,
+	};
 }
 
-export const daemonState: DaemonState = {
-	port: null,
-	token: null,
-};
-
-export async function connectDaemon(): Promise<void> {
-	if (daemonState.port !== null && daemonState.token !== null) return;
-
-	return new Promise((resolve, reject) => {
-		chrome.runtime.sendNativeMessage(
-			'com.vbm.daemon',
-			{ type: 'handshake', extensionId: chrome.runtime.id },
-			(response: NMHandshakeResponse | undefined) => {
-				if (chrome.runtime.lastError) {
-					daemonState.port = null;
-					daemonState.token = null;
-					reject(
-						new Error(
-							`Native messaging failed — is the vbm daemon installed? ${chrome.runtime.lastError.message}`,
-						),
-					);
-					return;
-				}
-				if (!response || response.type !== 'handshake_ok') {
-					daemonState.port = null;
-					daemonState.token = null;
-					reject(
-						new Error(
-							'Daemon returned unexpected handshake response',
-						),
-					);
-					return;
-				}
-				daemonState.port = response.port;
-				daemonState.token = response.token;
-				resolve();
-			},
-		);
-	});
+export async function saveDaemonConfig(
+	config: Partial<DaemonConfig>,
+): Promise<void> {
+	const update: Record<string, unknown> = {};
+	if (config.host !== undefined) update.vbmHost = config.host;
+	if (config.port !== undefined) update.vbmPort = config.port;
+	await chrome.storage.local.set(update);
 }
 
-// P2-09: reset cached state so next call to connectDaemon() re-runs the handshake.
-// Called when the daemon returns 401 (token rotated after restart).
-export function resetDaemon(): void {
-	daemonState.port = null;
-	daemonState.token = null;
-}
-
-export function getDaemonBase(): string {
-	return `http://127.0.0.1:${daemonState.port}`;
-}
-
-export function getAuthHeader(): string {
-	return `Bearer ${daemonState.token}`;
+export function getDaemonBase(config: DaemonConfig): string {
+	return `http://${config.host}:${config.port}`;
 }

@@ -51,9 +51,7 @@ const uiHTML = `<!DOCTYPE html>
 document.getElementById('search').onsubmit = async e => {
   e.preventDefault()
   const q = e.target.q.value
-  const r = await fetch('/search?q=' + encodeURIComponent(q) + '&limit=10', {
-    headers: {'Authorization': 'Bearer REPLACE_TOKEN'}
-  })
+  const r = await fetch('/search?q=' + encodeURIComponent(q) + '&limit=10')
   const data = await r.json()
   document.getElementById('results').innerHTML = data.results?.map(r =>
     '<div style="margin:8px 0"><a href="' + r.url + '">' + (r.title||r.url) + '</a><br><small>' + r.snippet + '</small></div>'
@@ -65,7 +63,7 @@ document.getElementById('search').onsubmit = async e => {
 
 // newRouter builds the HTTP router. extraOrigins are additional CORS-allowed origins
 // beyond chrome-extension:// (e.g. a local dashboard, configured via VBM_CORS_ORIGIN).
-func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins []string) http.Handler {
+func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -87,15 +85,8 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 	// P2-08: /metrics in Prometheus text format — no auth required for scraping.
 	r.Get("/metrics", m.handler(s))
 
-	// Auth-protected routes
 	r.Group(func(r chi.Router) {
-		// P0-NEW (v2): corsMiddleware MUST run before authMiddleware so that
-		// Access-Control-Allow-* headers are attached to every response
-		// (including 401 from auth rejection). Without this ordering the
-		// browser turns a CORS-less 401 into a network error, making
-		// VBM_CORS_ORIGIN effectively inoperante for non-preflight requests.
 		r.Use(corsMiddleware(extraOrigins))
-		r.Use(authMiddleware(token, extraOrigins))
 
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
 			var ir ingestRequest
@@ -287,15 +278,13 @@ func newRouter(s *store.Store, q *queue.Queue, token, ver string, extraOrigins [
 			}
 		})
 
-		// P2-01: inject actual session token so the embedded UI search form works.
-		uiWithToken := strings.ReplaceAll(uiHTML, "REPLACE_TOKEN", token)
 		r.Get("/ui", func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(uiWithToken))
+			w.Write([]byte(uiHTML))
 		})
 		r.Get("/ui/*", func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(uiWithToken))
+			w.Write([]byte(uiHTML))
 		})
 	})
 

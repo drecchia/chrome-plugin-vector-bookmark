@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/vbm/daemon/internal/embed"
 	"github.com/vbm/daemon/internal/nm"
 	"github.com/vbm/daemon/internal/queue"
@@ -47,31 +46,22 @@ func Run() error {
 
 	q := queue.New(s, 256)
 
-	token := uuid.New().String()
-
-	// P0-06: VBM_PORT always binds on loopback.
+	// Default port 7532. Override via VBM_PORT env var.
 	// Use VBM_BIND to override interface (Docker only — e.g. VBM_BIND=0.0.0.0).
-	listenAddr := "127.0.0.1:0"
-	if p := os.Getenv("VBM_PORT"); p != "" {
-		bind := "127.0.0.1"
-		if b := os.Getenv("VBM_BIND"); b != "" {
-			bind = b
-			slog.Warn("binding on non-loopback interface", "bind", bind)
-		}
-		listenAddr = bind + ":" + p
+	bind := "127.0.0.1"
+	if b := os.Getenv("VBM_BIND"); b != "" {
+		bind = b
+		slog.Warn("binding on non-loopback interface", "bind", bind)
 	}
+	portStr := "7532"
+	if p := os.Getenv("VBM_PORT"); p != "" {
+		portStr = p
+	}
+	listenAddr := bind + ":" + portStr
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-
-	if err := nm.WriteSession(&nm.Session{Port: port, Token: token}); err != nil {
-		return fmt.Errorf("write session: %w", err)
-	}
-	if sessionPath, err := nm.SessionPath(); err == nil {
-		defer os.Remove(sessionPath)
 	}
 
 	slog.Info("server listening", "addr", listener.Addr().String())
@@ -109,7 +99,7 @@ func Run() error {
 		}
 	}
 
-	r := newRouter(s, q, token, version, extraOrigins)
+	r := newRouter(s, q, version, extraOrigins)
 
 	srv := &http.Server{Handler: r}
 

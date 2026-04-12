@@ -1,5 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import type { StatusResponse, ForgetRequest } from '../../../proto/types';
+import {
+	DEFAULT_HOST,
+	DEFAULT_PORT,
+	saveDaemonConfig,
+} from '../background/native-bridge';
 
 export default function App() {
 	const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -8,6 +13,16 @@ export default function App() {
 	const [forgetValue, setForgetValue] = useState('');
 	const [forgetType, setForgetType] = useState<'url' | 'domain'>('url');
 	const [forgetMsg, setForgetMsg] = useState<string | null>(null);
+	const [host, setHost] = useState(DEFAULT_HOST);
+	const [port, setPort] = useState(String(DEFAULT_PORT));
+	const [configSaved, setConfigSaved] = useState(false);
+
+	useEffect(() => {
+		chrome.storage.local.get(['vbmHost', 'vbmPort'], (result) => {
+			if (result.vbmHost) setHost(result.vbmHost as string);
+			if (result.vbmPort) setPort(String(result.vbmPort));
+		});
+	}, []);
 
 	useEffect(() => {
 		chrome.runtime.sendMessage({ type: 'popup_status' }, (res) => {
@@ -37,6 +52,15 @@ export default function App() {
 				}
 			},
 		);
+	}
+
+	function handleSaveConfig() {
+		const p = parseInt(port, 10);
+		if (!host.trim() || isNaN(p) || p < 1 || p > 65535) return;
+		saveDaemonConfig({ host: host.trim(), port: p }).then(() => {
+			setConfigSaved(true);
+			setTimeout(() => setConfigSaved(false), 2000);
+		});
 	}
 
 	function handleForget() {
@@ -194,19 +218,59 @@ export default function App() {
 				</div>
 			)}
 
-			{/* P1-02: use daemon port from status instead of hardcoded 7700 */}
-			{status?.daemonPort && (
-				<button
-					style={linkBtn}
-					onClick={() => {
-						chrome.tabs.create({
-							url: `http://127.0.0.1:${status.daemonPort}/ui`,
-						});
-					}}
-				>
-					Open full UI
-				</button>
-			)}
+			<button
+				style={linkBtn}
+				onClick={() => {
+					chrome.tabs.create({
+						url: `http://${host}:${port}/ui`,
+					});
+				}}
+			>
+				Open full UI
+			</button>
+
+			<div>
+				<div style={sectionLabel}>Daemon</div>
+				<div style={{ ...row, marginTop: '6px' }}>
+					<input
+						style={{ ...input, flex: '1 1 120px' }}
+						type="text"
+						placeholder="host"
+						value={host}
+						onChange={(e) => setHost(e.target.value)}
+						onKeyDown={(e) =>
+							e.key === 'Enter' && handleSaveConfig()
+						}
+					/>
+					<input
+						style={{ ...input, flex: '0 0 60px' }}
+						type="number"
+						placeholder="port"
+						value={port}
+						onChange={(e) => setPort(e.target.value)}
+						onKeyDown={(e) =>
+							e.key === 'Enter' && handleSaveConfig()
+						}
+					/>
+					<button
+						style={{ ...btn, background: '#6b7280' }}
+						onClick={handleSaveConfig}
+					>
+						Save
+					</button>
+				</div>
+				{configSaved && (
+					<div
+						style={{
+							fontSize: '11px',
+							color: '#6b7280',
+							marginTop: '4px',
+						}}
+					>
+						Saved. Reload extension to reconnect.
+					</div>
+				)}
+			</div>
 
 			<div>
 				<div style={sectionLabel}>Forget</div>
