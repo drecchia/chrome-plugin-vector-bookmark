@@ -186,6 +186,34 @@ rm -rf ~/.local/share/vbm/
 
 ---
 
+## Localização dos dados
+
+O daemon armazena tudo em um único diretório, dependendo do sistema operacional:
+
+| Sistema | Diretório |
+|---|---|
+| Linux / macOS | `~/.local/share/vbm/` |
+| Windows | `%APPDATA%\vbm\` (ex: `C:\Users\<você>\AppData\Roaming\vbm\`) |
+
+Conteúdo do diretório:
+
+```
+vbm.db          # banco SQLite — páginas, chunks, embeddings, fila, blacklist
+session.json    # porta ativa do daemon (reescrito a cada restart)
+```
+
+Para apagar todos os dados indexados (irreversível):
+
+```bash
+# Linux/macOS
+rm -rf ~/.local/share/vbm/vbm.db
+
+# Windows (PowerShell)
+Remove-Item "$env:APPDATA\vbm\vbm.db"
+```
+
+---
+
 ## Busca semântica com embeddings
 
 Por padrão, o daemon usa um **embedder stub** (vetores zero) — a busca usa apenas BM25 (palavras exatas). Para ativar busca semântica real (encontrar "artigo sobre segurança com IA" buscando por "hacker" ou "pentest"), configure um embedder.

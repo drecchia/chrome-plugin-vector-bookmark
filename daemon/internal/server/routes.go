@@ -299,20 +299,25 @@ document.getElementById('tl-results').addEventListener('click',function(e){
   if(wasOpen)return
   row.classList.add('open')
   var word=row.dataset.word
-  var matches=(tlHistoryCache||[]).filter(function(pg){return(pg.keywords||[]).indexOf(word)!==-1})
   var el=row.querySelector('.kw-pages')
-  if(!matches.length){
-    el.innerHTML='<div class="kw-pages-empty">No pages found</div>'
-    return
-  }
-  el.innerHTML=matches.map(function(pg){
-    var d=new Date(pg.visitTs)
-    var t=d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
-    return '<div class="kw-page-item">'+
-      '<div class="kw-page-meta"><span class="kw-page-domain">'+esc(pg.domain)+'</span><span class="kw-page-time">'+t+'</span></div>'+
-      '<a class="kw-page-title" href="'+esc(pg.url)+'" target="_blank">'+esc(pg.title||pg.url)+'</a>'+
-    '</div>'
-  }).join('')
+  el.innerHTML='<div class="kw-pages-empty">Loading…</div>'
+  var p=tlPeriod()
+  fetch('/search?q='+encodeURIComponent(word)+'&limit=20')
+    .then(function(r){return r.json()})
+    .then(function(data){
+      // Cross-filter by current period — search returns all time, we scope to period
+      var results=(data.results||[]).filter(function(r){return r.visitTs>=p.from&&r.visitTs<p.to})
+      if(!results.length){el.innerHTML='<div class="kw-pages-empty">No pages found in this period</div>';return}
+      el.innerHTML=results.map(function(r){
+        var d=new Date(r.visitTs)
+        var t=d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
+        return '<div class="kw-page-item">'+
+          '<div class="kw-page-meta"><span class="kw-page-domain">'+esc(r.domain)+'</span><span class="kw-page-time">'+t+'</span></div>'+
+          '<a class="kw-page-title" href="'+esc(r.url)+'" target="_blank">'+esc(r.title||r.url)+'</a>'+
+        '</div>'
+      }).join('')
+    })
+    .catch(function(){el.innerHTML='<div class="kw-pages-empty">Failed to load</div>'})
 })
 document.getElementById('tl-prev').addEventListener('click',function(){
   if(tlMode==='week') tlAnchor.setDate(tlAnchor.getDate()-7)

@@ -9,6 +9,7 @@ import {
 } from './daemon-client';
 import { isDeniedUrl, isDeniedDomain } from '../lib/denylist';
 import { normaliseBlocklistEntry } from './native-bridge';
+import defaultBlacklist from './default-blacklist.json';
 
 interface ForgetRequest {
 	type: 'url' | 'domain' | 'timerange';
@@ -67,39 +68,16 @@ chrome.storage.local.get('vbmBlockedDomains', (result) => {
 
 // Default LLM chat domains — seeded once into the user blocklist so the
 // user can inspect and remove them via Open UI → Blocklist.
-const DEFAULT_BLOCKED_LLM_DOMAINS = [
-	'chatgpt.com',
-	'chat.openai.com',
-	'claude.ai',
-	'gemini.google.com',
-	'aistudio.google.com',
-	'copilot.microsoft.com',
-	'perplexity.ai',
-	'poe.com',
-	'character.ai',
-	'mistral.ai',
-	'huggingface.co',
-	'you.com',
-	'phind.com',
-	'groq.com',
-	'cohere.com',
-	'pi.ai',
-	'together.ai',
-	'replicate.com',
+// Default blocked entries loaded from default-blacklist.json at build time.
+// To add/remove entries, edit that file and rebuild — no TypeScript changes needed.
+const DEFAULT_BLOCKED_ALL = [
+	...defaultBlacklist.local,
+	...defaultBlacklist.llm,
+	...defaultBlacklist.social,
 ];
 
-// Private IP ranges and local TLDs — two regex entries cover all RFC1918 + loopback.
-const DEFAULT_BLOCKED_LOCAL = [
-	'/^(localhost|127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)/i',
-	'/\\.(local|internal|lan)$/i',
-];
-
-// Seed local ranges + LLM domains on every startup — addToBlocklist is idempotent (PRIMARY KEY).
-Promise.all(
-	[...DEFAULT_BLOCKED_LOCAL, ...DEFAULT_BLOCKED_LLM_DOMAINS].map((d) =>
-		addToBlocklist(d),
-	),
-)
+// Seed all default entries on every startup — addToBlocklist is idempotent (PRIMARY KEY).
+Promise.all(DEFAULT_BLOCKED_ALL.map((d) => addToBlocklist(d)))
 	.then(() => refreshBlocklist())
 	.catch(() => {});
 
