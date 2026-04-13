@@ -602,7 +602,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 	r.Group(func(r chi.Router) {
 		r.Use(corsMiddleware(extraOrigins))
 
-		// POST /visit — passive history record (metadata only, no text/embedding).
+		// POST /visit — passive history record + lightweight meta indexing.
 		r.Post("/visit", func(w http.ResponseWriter, req *http.Request) {
 			var vr struct {
 				URL     string          `json:"url"`
@@ -632,6 +632,40 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				http.Error(w, `{"error":"visit failed"}`, http.StatusInternalServerError)
 				return
 			}
+
+			// Build lightweight index text from title + meta tags so they are
+			// searchable via FTS5/vector without requiring a manual force-index.
+			var meta struct {
+				Description   string `json:"description"`
+				Keywords      string `json:"keywords"`
+				OgDescription string `json:"ogDescription"`
+				Author        string `json:"author"`
+			}
+			if metaJSON != "" {
+				_ = json.Unmarshal([]byte(metaJSON), &meta)
+			}
+			var parts []string
+			if vr.Title != "" {
+				parts = append(parts, vr.Title)
+			}
+			for _, v := range []string{meta.Description, meta.Keywords, meta.OgDescription, meta.Author} {
+				if v != "" {
+					parts = append(parts, v)
+				}
+			}
+			if len(parts) > 0 {
+				metaText := strings.Join(parts, "\n")
+				ir := store.IngestRequest{
+					URL:     vr.URL,
+					Title:   vr.Title,
+					Text:    metaText,
+					VisitTs: vr.VisitTs,
+					DwellMs: vr.DwellMs,
+					Domain:  vr.Domain,
+				}
+				q.Enqueue(ir)
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"ok":true}`))
 		})

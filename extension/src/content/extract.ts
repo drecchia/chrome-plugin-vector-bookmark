@@ -93,6 +93,21 @@ if (!window.__vbm_cs) {
 		document.visibilityState === 'visible' ? Date.now() : null;
 	let sent = false;
 	let dwellStartedSent = false;
+	let currentUrl = location.href;
+
+	function resetDwell() {
+		dwellMs = 0;
+		sent = false;
+		dwellStartedSent = false;
+		lastVisible =
+			document.visibilityState === 'visible' ? Date.now() : null;
+		currentUrl = location.href;
+		try {
+			runtimeSend({ type: 'url_changed', url: currentUrl });
+		} catch {
+			// chrome.runtime may be unavailable (extension reload or sandboxed frame).
+		}
+	}
 
 	function accumulateDwell() {
 		if (lastVisible !== null) {
@@ -110,6 +125,27 @@ if (!window.__vbm_cs) {
 				lastVisible = null;
 			}
 		}
+	});
+
+	// SPA navigation: intercept history API and popstate to reset dwell state.
+	// Wrapped in try-catch because some pages (iframes, sandboxed contexts) may
+	// override history before chrome.runtime is ready or restrict property access.
+	try {
+		const _pushState = history.pushState.bind(history);
+		const _replaceState = history.replaceState.bind(history);
+		history.pushState = (...args) => {
+			_pushState(...args);
+			if (location.href !== currentUrl) resetDwell();
+		};
+		history.replaceState = (...args) => {
+			_replaceState(...args);
+			if (location.href !== currentUrl) resetDwell();
+		};
+	} catch {
+		// history API not patchable in this context — skip SPA intercept.
+	}
+	window.addEventListener('popstate', () => {
+		if (location.href !== currentUrl) resetDwell();
 	});
 
 	// Hot-update threshold when the user changes it in the popup.

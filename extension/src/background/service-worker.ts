@@ -52,18 +52,33 @@ const BADGE_COLORS: Record<BadgeState, string> = {
 	disconnected: '#ef4444', // red
 };
 const BADGE_TITLES: Record<BadgeState, string> = {
-	blocked: 'Vector Bookmark: page blocked',
+	blocked: 'Vector Bookmark: not tracking this site',
 	tracking: 'Vector Bookmark: tracking dwell time…',
 	visited: 'Vector Bookmark: visit recorded',
 	indexed: 'Vector Bookmark: page indexed',
 	disconnected: 'Vector Bookmark: daemon unreachable',
 };
+// Priority order — higher index wins; dwell_started must not downgrade visited/indexed.
+const BADGE_PRIORITY: Record<BadgeState, number> = {
+	tracking: 0,
+	disconnected: 1,
+	blocked: 2,
+	visited: 3,
+	indexed: 4,
+};
+const tabBadgeState = new Map<number, BadgeState>();
+
 function setBadge(tabId: number, state: BadgeState | 'clear'): void {
 	if (state === 'clear') {
+		tabBadgeState.delete(tabId);
 		chrome.action.setBadgeText({ text: '', tabId });
 		chrome.action.setTitle({ title: 'Vector Bookmark', tabId });
 		return;
 	}
+	// Never downgrade a higher-priority state (e.g. visited → tracking on revisits).
+	const current = tabBadgeState.get(tabId);
+	if (current && BADGE_PRIORITY[current] > BADGE_PRIORITY[state]) return;
+	tabBadgeState.set(tabId, state);
 	chrome.action.setBadgeText({ text: '●', tabId });
 	chrome.action.setBadgeBackgroundColor({
 		color: BADGE_COLORS[state],
@@ -128,11 +143,17 @@ let blockedDomains: string[] = [];
 function isBlockedByUser(hostname: string): boolean {
 	const h = hostname.toLowerCase();
 	return blockedDomains.some((entry) => {
-		if (entry.startsWith('/') && entry.endsWith('/')) {
-			try {
-				return new RegExp(entry.slice(1, -1), 'i').test(h);
-			} catch {
-				return false;
+		if (entry.startsWith('/')) {
+			// Support /pattern/ and /pattern/flags formats.
+			const lastSlash = entry.lastIndexOf('/');
+			if (lastSlash > 0) {
+				const pattern = entry.slice(1, lastSlash);
+				const flags = entry.slice(lastSlash + 1);
+				try {
+					return new RegExp(pattern, flags || 'i').test(h);
+				} catch {
+					return false;
+				}
 			}
 		}
 		return h === entry || h.endsWith('.' + entry);
@@ -338,6 +359,12 @@ chrome.runtime.onMessage.addListener(
 			setBadge(sender.tab.id, 'tracking');
 		}
 
+		if (msg.type === 'url_changed' && sender.tab?.id !== undefined) {
+			// SPA navigation: reset badge so dwell tracking restarts for new URL.
+			tabBadgeState.delete(sender.tab.id);
+			setBadge(sender.tab.id, 'tracking');
+		}
+
 		if (msg.type === 'page_sensitive') {
 			console.log('[VBM] Sensitive page detected — skipping ingest');
 		}
@@ -483,6 +510,43 @@ chrome.runtime.onMessage.addListener(
 			});
 			return true;
 		}
+
+		// Add current tab's domain to the user blacklist.
+		if (msg.type === 'popup_ignore_domain') {
+			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+				const url = tabs[0]?.url;
+				const tabId = tabs[0]?.id;
+				if (
+					!url ||
+					url.startsWith('chrome://') ||
+					url.startsWith('chrome-extension://')
+				) {
+					sendResponse({
+						ok: false,
+						error: 'Cannot ignore this page type',
+					});
+					return;
+				}
+				let hostname: string;
+				try {
+					hostname = new URL(url).hostname;
+				} catch {
+					sendResponse({ ok: false, error: 'Invalid URL' });
+					return;
+				}
+				const pattern = normaliseBlacklistEntry(hostname);
+				addToBlacklist(pattern)
+					.then(() => {
+						blockedDomains = [...blockedDomains, pattern];
+						if (tabId !== undefined) setBadge(tabId, 'blocked');
+						sendResponse({ ok: true, domain: hostname });
+					})
+					.catch((e) =>
+						sendResponse({ ok: false, error: String(e) }),
+					);
+			});
+			return true;
+		}
 	},
 );
 
@@ -496,10 +560,14 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 	}
 });
 
-// Update badge when a tab finishes loading a new URL.
+// Reset per-tab state on new navigation so priority guard doesn't carry over.
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+	if (info.status === 'loading' && info.url) tabBadgeState.delete(tabId);
 	if (info.status === 'complete' && tab.url) updateTabBadge(tabId, tab.url);
 });
+
+// Clean up state when a tab is closed.
+chrome.tabs.onRemoved.addListener((tabId) => tabBadgeState.delete(tabId));
 
 chrome.omnibox.onInputChanged.addListener(
 	(

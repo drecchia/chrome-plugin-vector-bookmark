@@ -99,6 +99,14 @@ export default function App() {
 		});
 	}
 
+	function handleIgnoreDomain() {
+		chrome.runtime.sendMessage({ type: 'popup_ignore_domain' }, (res) => {
+			if (chrome.runtime.lastError) return;
+			if (res?.ok) flash(`${res.domain} ignored`);
+			else flash(res?.error ?? 'Could not ignore domain', false);
+		});
+	}
+
 	function handleRemovePage() {
 		if (!currentTabUrl) return;
 		const req: ForgetRequest = { type: 'url', value: currentTabUrl };
@@ -518,6 +526,24 @@ export default function App() {
 			{/* Index this page */}
 			<button style={s.indexBtn} onClick={handleForceIndex}>
 				Index this page now
+			</button>
+
+			{/* Don't track this site — subordinate, destructive-ish */}
+			<button
+				onClick={handleIgnoreDomain}
+				style={{
+					background: 'none',
+					border: 'none',
+					cursor: 'pointer',
+					fontSize: '11px',
+					color: '#9ca3af',
+					padding: '2px 0',
+					textAlign: 'left' as const,
+					textDecoration: 'underline',
+					textDecorationStyle: 'dotted' as const,
+				}}
+			>
+				Don't track this site
 			</button>
 
 			{/* Page status indicator */}

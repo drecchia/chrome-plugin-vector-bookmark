@@ -1,8 +1,10 @@
 import {
 	type IngestRequest,
+	type VisitRequest,
 	type SearchResult,
 	type SearchResponse,
 	type ForgetRequest,
+	type PageStatusResponse,
 } from '../../../proto/types';
 import { getDaemonConfig, getDaemonBase } from './native-bridge';
 
@@ -10,6 +12,16 @@ async function checkResponse(res: Response): Promise<void> {
 	if (!res.ok) {
 		throw new Error(`Daemon HTTP error ${res.status}: ${res.statusText}`);
 	}
+}
+
+export async function recordVisit(req: VisitRequest): Promise<void> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/visit`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(req),
+	});
+	await checkResponse(res);
 }
 
 export async function ingest(req: IngestRequest): Promise<void> {
@@ -45,6 +57,7 @@ export async function forget(req: ForgetRequest): Promise<void> {
 }
 
 export async function getStatus(): Promise<{
+	visited: number;
 	indexed: number;
 	pending: number;
 	version: string;
@@ -55,6 +68,7 @@ export async function getStatus(): Promise<{
 	const res = await fetch(`${getDaemonBase(cfg)}/status`);
 	await checkResponse(res);
 	const data = (await res.json()) as {
+		visited: number;
 		indexed: number;
 		pending: number;
 		version: string;
@@ -77,23 +91,22 @@ export async function healthz(): Promise<boolean> {
 	}
 }
 
-export async function pageExists(url: string): Promise<boolean> {
+export async function pageStatus(url: string): Promise<PageStatusResponse> {
 	try {
 		const cfg = await getDaemonConfig();
 		const params = new URLSearchParams({ url });
 		const res = await fetch(`${getDaemonBase(cfg)}/page?${params}`);
-		if (!res.ok) return false;
-		const data = (await res.json()) as { indexed: boolean };
-		return data.indexed;
+		if (!res.ok) return { exists: false, indexed: false };
+		return (await res.json()) as PageStatusResponse;
 	} catch {
-		return false;
+		return { exists: false, indexed: false };
 	}
 }
 
-export async function getBlocklist(): Promise<string[]> {
+export async function getBlacklist(): Promise<string[]> {
 	try {
 		const cfg = await getDaemonConfig();
-		const res = await fetch(`${getDaemonBase(cfg)}/blocklist`);
+		const res = await fetch(`${getDaemonBase(cfg)}/blacklist`);
 		if (!res.ok) return [];
 		const data = (await res.json()) as { patterns: string[] };
 		return data.patterns ?? [];
@@ -102,9 +115,9 @@ export async function getBlocklist(): Promise<string[]> {
 	}
 }
 
-export async function addToBlocklist(pattern: string): Promise<void> {
+export async function addToBlacklist(pattern: string): Promise<void> {
 	const cfg = await getDaemonConfig();
-	const res = await fetch(`${getDaemonBase(cfg)}/blocklist`, {
+	const res = await fetch(`${getDaemonBase(cfg)}/blacklist`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ pattern }),
@@ -112,9 +125,9 @@ export async function addToBlocklist(pattern: string): Promise<void> {
 	await checkResponse(res);
 }
 
-export async function removeFromBlocklist(pattern: string): Promise<void> {
+export async function removeFromBlacklist(pattern: string): Promise<void> {
 	const cfg = await getDaemonConfig();
-	const res = await fetch(`${getDaemonBase(cfg)}/blocklist`, {
+	const res = await fetch(`${getDaemonBase(cfg)}/blacklist`, {
 		method: 'DELETE',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ pattern }),
