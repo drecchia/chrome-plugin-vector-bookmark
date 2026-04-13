@@ -133,6 +133,28 @@ func New(dataDir string, e embed.Embedder) (*Store, error) {
 	return &Store{db: db, embedder: e}, nil
 }
 
+// LoadPendingItems returns all queue rows with status='pending' so they can be
+// re-enqueued after a daemon restart. Items that were in-flight when the daemon
+// crashed are recovered this way.
+func (s *Store) LoadPendingItems() ([]IngestRequest, error) {
+	rows, err := s.db.Query(`
+		SELECT url, title, text, visit_ts, dwell_ms, domain
+		FROM queue WHERE status = 'pending' ORDER BY id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("load pending: %w", err)
+	}
+	defer rows.Close()
+	var items []IngestRequest
+	for rows.Next() {
+		var r IngestRequest
+		if err := rows.Scan(&r.URL, &r.Title, &r.Text, &r.VisitTs, &r.DwellMs, &r.Domain); err != nil {
+			return nil, fmt.Errorf("scan pending: %w", err)
+		}
+		items = append(items, r)
+	}
+	return items, rows.Err()
+}
+
 // migrate applies all pending schema migrations in order.
 // Schema versions are tracked in the schema_versions table.
 func migrate(db *sql.DB) error {

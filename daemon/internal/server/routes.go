@@ -98,6 +98,20 @@ h1{font-size:15px;font-weight:600}
 .bl-remove:hover{color:#ef4444}
 .kw-count{font-size:11px;color:#9ca3af;width:32px;text-align:right;flex-shrink:0}
 .tl-meta{font-size:11px;color:#9ca3af;margin-top:12px}
+.kw-row{cursor:pointer;flex-wrap:wrap;border-radius:4px;margin:0 -4px;padding:5px 4px}
+.kw-row:hover{background:#f9fafb}
+.kw-arrow{font-size:9px;color:#9ca3af;width:12px;flex-shrink:0;display:inline-block;transition:transform .15s;user-select:none;margin-top:1px}
+.kw-row.open>.kw-arrow{transform:rotate(90deg)}
+.kw-pages{width:100%;margin-top:6px;padding-left:30px;display:none;border-top:1px solid #f3f4f6;padding-top:6px}
+.kw-row.open>.kw-pages{display:block}
+.kw-pages-empty{font-size:12px;color:#9ca3af;padding:4px 0}
+.kw-page-item{padding:5px 0;border-bottom:1px solid #f9fafb}
+.kw-page-item:last-child{border-bottom:none}
+.kw-page-meta{display:flex;gap:6px;align-items:baseline;margin-bottom:1px}
+.kw-page-domain{font-size:11px;color:#6366f1;font-weight:500}
+.kw-page-time{font-size:11px;color:#9ca3af}
+.kw-page-title{font-size:12px;color:#374151;text-decoration:none;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kw-page-title:hover{color:#6366f1}
 /* history timeline */
 .hist-chart{margin-bottom:18px;overflow:hidden;border-radius:4px}
 .hist-day-label{display:flex;justify-content:space-between;font-size:10px;color:#9ca3af;margin-top:4px;padding:0 1px}
@@ -239,35 +253,67 @@ function tlLabel(){
     return tlAnchor.toLocaleDateString([],{month:'long',year:'numeric'})
   }
 }
+var tlHistoryCache=null
 function tlRender(){
   var p=tlPeriod()
+  tlHistoryCache=null
   document.getElementById('tl-label').textContent=tlLabel()
   document.getElementById('tl-results').innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
-  fetch('/topics?from='+p.from+'&to='+p.to+'&limit=20')
-    .then(function(r){return r.json()})
-    .then(function(d){
-      var kws=d.keywords||[]
-      if(!kws.length){
-        document.getElementById('tl-results').innerHTML='<div class="empty">No pages indexed in this period</div>'
-        return
-      }
-      var max=kws[0].count
-      document.getElementById('tl-results').innerHTML=
-        '<div class="kw-list">'+
-        kws.map(function(k,i){
-          var pct=Math.round(k.count/max*100)
-          return '<div class="kw-row">'+
-            '<span class="kw-rank">'+(i+1)+'</span>'+
-            '<span class="kw-word">'+esc(k.word)+'</span>'+
-            '<div class="kw-bar-wrap"><div class="kw-bar" style="width:'+pct+'%"></div></div>'+
-            '<span class="kw-count">'+k.count+'</span>'+
-          '</div>'
-        }).join('')+
-        '</div>'+
-        '<div class="tl-meta">'+kws.length+' terms &middot; '+d.total_chunks+' chunks analyzed</div>'
-    })
-    .catch(function(){document.getElementById('tl-results').innerHTML='<div class="empty">Failed to load</div>'})
+  Promise.all([
+    fetch('/topics?from='+p.from+'&to='+p.to+'&limit=20').then(function(r){return r.json()}),
+    fetch('/history?from='+p.from+'&to='+p.to+'&limit=100').then(function(r){return r.json()})
+  ]).then(function(res){
+    var d=res[0],h=res[1]
+    tlHistoryCache=h.pages||[]
+    var kws=d.keywords||[]
+    if(!kws.length){
+      document.getElementById('tl-results').innerHTML='<div class="empty">No pages indexed in this period</div>'
+      return
+    }
+    var max=kws[0].count
+    document.getElementById('tl-results').innerHTML=
+      '<div class="kw-list">'+
+      kws.map(function(k,i){
+        var pct=Math.round(k.count/max*100)
+        return '<div class="kw-row" data-word="'+esc(k.word)+'">'+
+          '<span class="kw-arrow">&#9658;</span>'+
+          '<span class="kw-rank">'+(i+1)+'</span>'+
+          '<span class="kw-word">'+esc(k.word)+'</span>'+
+          '<div class="kw-bar-wrap"><div class="kw-bar" style="width:'+pct+'%"></div></div>'+
+          '<span class="kw-count">'+k.count+'</span>'+
+          '<div class="kw-pages"></div>'+
+        '</div>'
+      }).join('')+
+      '</div>'+
+      '<div class="tl-meta">'+kws.length+' terms &middot; '+d.total_chunks+' chunks analyzed</div>'
+  })
+  .catch(function(){document.getElementById('tl-results').innerHTML='<div class="empty">Failed to load</div>'})
 }
+// Delegated click handler — added once, survives tlRender() re-renders
+document.getElementById('tl-results').addEventListener('click',function(e){
+  var row=e.target.closest('.kw-row');if(!row)return
+  var wasOpen=row.classList.contains('open')
+  document.querySelectorAll('#tl-results .kw-row.open').forEach(function(r){
+    r.classList.remove('open');r.querySelector('.kw-pages').innerHTML=''
+  })
+  if(wasOpen)return
+  row.classList.add('open')
+  var word=row.dataset.word
+  var matches=(tlHistoryCache||[]).filter(function(pg){return(pg.keywords||[]).indexOf(word)!==-1})
+  var el=row.querySelector('.kw-pages')
+  if(!matches.length){
+    el.innerHTML='<div class="kw-pages-empty">No pages found</div>'
+    return
+  }
+  el.innerHTML=matches.map(function(pg){
+    var d=new Date(pg.visitTs)
+    var t=d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
+    return '<div class="kw-page-item">'+
+      '<div class="kw-page-meta"><span class="kw-page-domain">'+esc(pg.domain)+'</span><span class="kw-page-time">'+t+'</span></div>'+
+      '<a class="kw-page-title" href="'+esc(pg.url)+'" target="_blank">'+esc(pg.title||pg.url)+'</a>'+
+    '</div>'
+  }).join('')
+})
 document.getElementById('tl-prev').addEventListener('click',function(){
   if(tlMode==='week') tlAnchor.setDate(tlAnchor.getDate()-7)
   else tlAnchor.setMonth(tlAnchor.getMonth()-1)

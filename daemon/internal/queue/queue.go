@@ -46,10 +46,11 @@ func (q *Queue) worker() {
 	defer q.wg.Done()
 	for req := range q.ch {
 		if err := q.store.Ingest(req); err != nil {
+			// Leave the queue row as 'pending' — it will be retried on next startup.
 			slog.Error("ingest error", "url", req.URL, "err", err)
 			continue
 		}
-		// P2-02: remove from persistent queue after successful ingest.
+		// P2-02: remove from persistent queue only after successful ingest.
 		if err := q.store.RemoveQueueItem(req.URL); err != nil {
 			slog.Warn("remove queue item error", "url", req.URL, "err", err)
 		}

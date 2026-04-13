@@ -56,6 +56,16 @@ func Run() error {
 
 	q := queue.New(s, 256)
 
+	// Re-enqueue any items that were pending when the daemon last shut down or crashed.
+	if pending, err := s.LoadPendingItems(); err != nil {
+		slog.Warn("could not load pending queue items", "err", err)
+	} else if len(pending) > 0 {
+		slog.Info("re-enqueueing pending items from previous run", "count", len(pending))
+		for _, item := range pending {
+			q.Enqueue(item)
+		}
+	}
+
 	// Default port 7532. Override via VBM_PORT env var.
 	// Use VBM_BIND to override interface (Docker only — e.g. VBM_BIND=0.0.0.0).
 	bind := "127.0.0.1"

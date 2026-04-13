@@ -88,8 +88,18 @@ const DEFAULT_BLOCKED_LLM_DOMAINS = [
 	'replicate.com',
 ];
 
-// Seed LLM domains on every startup — addToBlocklist is idempotent (PRIMARY KEY).
-Promise.all(DEFAULT_BLOCKED_LLM_DOMAINS.map((d) => addToBlocklist(d)))
+// Private IP ranges and local TLDs — two regex entries cover all RFC1918 + loopback.
+const DEFAULT_BLOCKED_LOCAL = [
+	'/^(localhost|127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)/i',
+	'/\\.(local|internal|lan)$/i',
+];
+
+// Seed local ranges + LLM domains on every startup — addToBlocklist is idempotent (PRIMARY KEY).
+Promise.all(
+	[...DEFAULT_BLOCKED_LOCAL, ...DEFAULT_BLOCKED_LLM_DOMAINS].map((d) =>
+		addToBlocklist(d),
+	),
+)
 	.then(() => refreshBlocklist())
 	.catch(() => {});
 
