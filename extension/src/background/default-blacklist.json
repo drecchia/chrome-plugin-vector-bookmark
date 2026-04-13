@@ -3,44 +3,7 @@
 		"/^(localhost|127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)/i",
 		"/\\.(local|internal|lan)$/i"
 	],
-	"llm": [
-		"chatgpt.com",
-		"chat.openai.com",
-		"claude.ai",
-		"gemini.google.com",
-		"aistudio.google.com",
-		"copilot.microsoft.com",
-		"perplexity.ai",
-		"poe.com",
-		"character.ai",
-		"mistral.ai",
-		"huggingface.co",
-		"you.com",
-		"phind.com",
-		"groq.com",
-		"cohere.com",
-		"pi.ai",
-		"together.ai",
-		"replicate.com"
-	],
-	"social": [
-		"twitter.com",
-		"x.com",
-		"facebook.com",
-		"instagram.com",
-		"threads.net",
-		"linkedin.com",
-		"tiktok.com",
-		"snapchat.com",
-		"pinterest.com",
-		"reddit.com",
-		"tumblr.com",
-		"twitch.tv",
-		"discord.com",
-		"whatsapp.com",
-		"web.telegram.org",
-		"bsky.app",
-		"mastodon.social",
-		"youtube.com"
-	]
+	"llm": [],
+	"social": [],
+	"adult": []
 }

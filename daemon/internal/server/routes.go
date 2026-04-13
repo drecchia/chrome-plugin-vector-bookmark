@@ -18,13 +18,12 @@ import (
 )
 
 type ingestRequest struct {
-	URL      string `json:"url"`
-	Title    string `json:"title"`
-	Text     string `json:"text"`
-	VisitTs  int64  `json:"visitTs"`
-	DwellMs  int64  `json:"dwellMs"`
-	Domain   string `json:"domain"`
-	StarRank bool   `json:"starRank"`
+	URL     string `json:"url"`
+	Title   string `json:"title"`
+	Text    string `json:"text"`
+	VisitTs int64  `json:"visitTs"`
+	DwellMs int64  `json:"dwellMs"`
+	Domain  string `json:"domain"`
 }
 
 type forgetRequest struct {
@@ -91,7 +90,7 @@ h1{font-size:15px;font-weight:600}
 .kw-word{font-size:13px;font-weight:500;color:#111;width:120px;flex-shrink:0}
 .kw-bar-wrap{flex:1;background:#f3f4f6;border-radius:3px;height:6px;overflow:hidden}
 .kw-bar{height:100%;background:#6366f1;border-radius:3px;transition:width .3s}
-/* blocklist */
+/* blacklist */
 .bl-row{display:flex;gap:8px;margin-bottom:4px}
 .bl-entry{display:flex;align-items:center;justify-content:space-between;font-size:13px;color:#374151;background:#f9fafb;border:1px solid #e5e7eb;border-radius:5px;padding:6px 10px}
 .bl-remove{background:none;border:none;cursor:pointer;font-size:16px;color:#9ca3af;line-height:1;padding:0 0 0 10px}
@@ -137,7 +136,7 @@ h1{font-size:15px;font-weight:600}
     <button class="tab active" data-panel="search-panel">Search</button>
     <button class="tab" data-panel="hotwords-panel">Hot Words</button>
     <button class="tab" data-panel="hist-panel">Timeline</button>
-    <button class="tab" data-panel="blocklist-panel">Blacklist</button>
+    <button class="tab" data-panel="blacklist-panel">Exclusions</button>
   </div>
 
   <div id="search-panel" class="panel active">
@@ -163,13 +162,14 @@ h1{font-size:15px;font-weight:600}
     <div id="tl-results"></div>
   </div>
 
-  <div id="blocklist-panel" class="panel">
+  <div id="blacklist-panel" class="panel">
     <div class="bl-row">
       <input id="bl-input" type="text" placeholder="example.com or /regex/" style="flex:1;padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;outline:none;background:#fff">
-      <button id="bl-add" style="padding:8px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;background:#111;color:#fff;white-space:nowrap">Block</button>
+      <button id="bl-add" style="padding:8px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;background:#111;color:#fff;white-space:nowrap">Exclude</button>
     </div>
-    <div id="bl-list" style="margin-top:14px;display:flex;flex-direction:column;gap:4px"></div>
-    <div id="bl-empty" class="empty" style="display:none">No blacklisted domains</div>
+    <input id="bl-search" type="search" placeholder="Filter exclusions…" style="width:100%;margin-top:10px;padding:7px 12px;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;outline:none;background:#fff;display:none">
+    <div id="bl-list" style="margin-top:8px;display:flex;flex-direction:column;gap:4px"></div>
+    <div id="bl-empty" class="empty" style="display:none">No exclusions</div>
   </div>
 
   <div id="hist-panel" class="panel">
@@ -403,11 +403,10 @@ function htRender(){
         return'<div class="hist-group">'+
           '<div class="hist-date">'+esc(dateKey)+'</div>'+
           groups[dateKey].map(function(pg){
-            var star=pg.starRank?'&#11088; ':''
             var kws=(pg.keywords||[]).map(function(w){return'<span class="hist-kw">'+esc(w)+'</span>'}).join('')
             return'<div class="hist-page">'+
               '<div class="hist-page-meta"><span class="hist-domain">'+esc(pg.domain)+'</span><span style="font-size:11px;color:#9ca3af">'+new Date(pg.visitTs).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</span></div>'+
-              '<a class="hist-page-title" href="'+esc(pg.url)+'" target="_blank">'+star+esc(pg.title||pg.url)+'</a>'+
+              '<a class="hist-page-title" href="'+esc(pg.url)+'" target="_blank">'+esc(pg.title||pg.url)+'</a>'+
               (kws?'<div class="hist-kws">'+kws+'</div>':'')+
             '</div>'
           }).join('')+
@@ -441,32 +440,41 @@ document.getElementById('ht-month').addEventListener('click',function(){
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
   if(t.dataset.panel==='hist-panel')htRender()
 })})
-// Blocklist panel
-var blInput=document.getElementById('bl-input'),blList=document.getElementById('bl-list'),blEmpty=document.getElementById('bl-empty')
+// Blacklist panel
+var blInput=document.getElementById('bl-input'),blList=document.getElementById('bl-list'),blEmpty=document.getElementById('bl-empty'),blSearch=document.getElementById('bl-search')
+var blAll=[]
 function blRender(patterns){
+  blAll=patterns||[]
+  blSearch.style.display=blAll.length?'block':'none'
+  blFilter()
+}
+function blFilter(){
+  var q=(blSearch.value||'').toLowerCase().trim()
+  var filtered=q?blAll.filter(function(p){return p.toLowerCase().indexOf(q)!==-1}):blAll
   blList.innerHTML=''
-  if(!patterns||!patterns.length){blEmpty.style.display='';return}
+  if(!filtered.length){blEmpty.style.display='';return}
   blEmpty.style.display='none'
-  patterns.forEach(function(p){
+  filtered.forEach(function(p){
     var d=document.createElement('div');d.className='bl-entry'
     var t=document.createElement('span');t.textContent=p
     var b=document.createElement('button');b.className='bl-remove';b.textContent='×';b.title='Remove'
     b.addEventListener('click',function(){
-      fetch('/blocklist',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:p})})
-        .then(function(){return fetch('/blocklist')}).then(function(r){return r.json()}).then(function(d){blRender(d.patterns)})
+      fetch('/blacklist',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:p})})
+        .then(function(){return fetch('/blacklist')}).then(function(r){return r.json()}).then(function(d){blRender(d.patterns)})
     })
     d.appendChild(t);d.appendChild(b);blList.appendChild(d)
   })
 }
-function blLoad(){fetch('/blocklist').then(function(r){return r.json()}).then(function(d){blRender(d.patterns)}).catch(function(){})}
+function blLoad(){fetch('/blacklist').then(function(r){return r.json()}).then(function(d){blRender(d.patterns)}).catch(function(){})}
+blSearch.addEventListener('input',blFilter)
 document.getElementById('bl-add').addEventListener('click',function(){
   var v=blInput.value.trim();if(!v)return
-  fetch('/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:v})})
-    .then(function(){blInput.value='';return fetch('/blocklist')}).then(function(r){return r.json()}).then(function(d){blRender(d.patterns)})
+  fetch('/blacklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:v})})
+    .then(function(){blInput.value='';return fetch('/blacklist')}).then(function(r){return r.json()}).then(function(d){blRender(d.patterns)})
 })
 blInput.addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('bl-add').click()})
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
-  if(t.dataset.panel==='blocklist-panel')blLoad()
+  if(t.dataset.panel==='blacklist-panel')blLoad()
 })})
 </script>
 </body>
@@ -594,6 +602,41 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 	r.Group(func(r chi.Router) {
 		r.Use(corsMiddleware(extraOrigins))
 
+		// POST /visit — passive history record (metadata only, no text/embedding).
+		r.Post("/visit", func(w http.ResponseWriter, req *http.Request) {
+			var vr struct {
+				URL     string          `json:"url"`
+				Title   string          `json:"title"`
+				VisitTs int64           `json:"visitTs"`
+				DwellMs int64           `json:"dwellMs"`
+				Domain  string          `json:"domain"`
+				Meta    json.RawMessage `json:"meta"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&vr); err != nil {
+				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+				return
+			}
+			metaJSON := ""
+			if len(vr.Meta) > 0 && string(vr.Meta) != "null" {
+				metaJSON = string(vr.Meta)
+			}
+			if err := s.RecordVisit(store.VisitRequest{
+				URL:      vr.URL,
+				Title:    vr.Title,
+				VisitTs:  vr.VisitTs,
+				DwellMs:  vr.DwellMs,
+				Domain:   vr.Domain,
+				MetaJSON: metaJSON,
+			}); err != nil {
+				slog.Warn("record visit error", "url", vr.URL, "err", err)
+				http.Error(w, `{"error":"visit failed"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`))
+		})
+
+		// POST /ingest — manual full-index with text extraction + embedding.
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
 			var ir ingestRequest
 			if err := json.NewDecoder(req.Body).Decode(&ir); err != nil {
@@ -601,13 +644,12 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				return
 			}
 			ireq := store.IngestRequest{
-				URL:      ir.URL,
-				Title:    ir.Title,
-				Text:     ir.Text,
-				VisitTs:  ir.VisitTs,
-				DwellMs:  ir.DwellMs,
-				Domain:   ir.Domain,
-				StarRank: ir.StarRank,
+				URL:     ir.URL,
+				Title:   ir.Title,
+				Text:    ir.Text,
+				VisitTs: ir.VisitTs,
+				DwellMs: ir.DwellMs,
+				Domain:  ir.Domain,
 			}
 			q.Enqueue(ireq)
 			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
@@ -685,22 +727,24 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 		})
 
 		r.Get("/status", func(w http.ResponseWriter, req *http.Request) {
-			indexed, pending, err := s.GetStatus()
+			visited, indexed, pending, err := s.GetStatus()
 			if err != nil {
 				http.Error(w, `{"error":"status failed"}`, http.StatusInternalServerError)
 				return
 			}
 			type statusResponse struct {
-				Indexed        int    `json:"indexed"`
-				Pending        int    `json:"pending"`
-				Version        string `json:"version"`
+				Visited         int    `json:"visited"`
+				Indexed         int    `json:"indexed"`
+				Pending         int    `json:"pending"`
+				Version         string `json:"version"`
 				EmbedderVersion string `json:"embedder_version"`
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(statusResponse{
-				Indexed:        indexed,
-				Pending:        pending,
-				Version:        ver,
+				Visited:         visited,
+				Indexed:         indexed,
+				Pending:         pending,
+				Version:         ver,
 				EmbedderVersion: s.EmbedderVersion(),
 			})
 		})
@@ -712,21 +756,22 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				http.Error(w, `{"error":"url param required"}`, http.StatusBadRequest)
 				return
 			}
-			exists, err := s.PageExists(rawURL)
+			exists, indexed, err := s.PageStatus(rawURL)
 			if err != nil {
 				http.Error(w, `{"error":"lookup failed"}`, http.StatusInternalServerError)
 				return
 			}
 			json.NewEncoder(w).Encode(struct {
+				Exists  bool `json:"exists"`
 				Indexed bool `json:"indexed"`
-			}{Indexed: exists})
+			}{Exists: exists, Indexed: indexed})
 		})
 
-		// CR-010: user-managed domain blocklist endpoints.
-		r.Get("/blocklist", func(w http.ResponseWriter, req *http.Request) {
-			patterns, err := s.GetBlocklist()
+		// CR-010: user-managed domain blacklist endpoints.
+		r.Get("/blacklist", func(w http.ResponseWriter, req *http.Request) {
+			patterns, err := s.GetBlacklist()
 			if err != nil {
-				http.Error(w, `{"error":"get blocklist failed"}`, http.StatusInternalServerError)
+				http.Error(w, `{"error":"get blacklist failed"}`, http.StatusInternalServerError)
 				return
 			}
 			if patterns == nil {
@@ -738,7 +783,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			}{Patterns: patterns})
 		})
 
-		r.Post("/blocklist", func(w http.ResponseWriter, req *http.Request) {
+		r.Post("/blacklist", func(w http.ResponseWriter, req *http.Request) {
 			var body struct {
 				Pattern string `json:"pattern"`
 			}
@@ -746,7 +791,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
 				return
 			}
-			if err := s.AddToBlocklist(body.Pattern); err != nil {
+			if err := s.AddToBlacklist(body.Pattern); err != nil {
 				http.Error(w, `{"error":"add failed"}`, http.StatusInternalServerError)
 				return
 			}
@@ -754,7 +799,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			w.Write([]byte(`{"ok":true}`))
 		})
 
-		r.Delete("/blocklist", func(w http.ResponseWriter, req *http.Request) {
+		r.Delete("/blacklist", func(w http.ResponseWriter, req *http.Request) {
 			var body struct {
 				Pattern string `json:"pattern"`
 			}
@@ -762,7 +807,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
 				return
 			}
-			if err := s.RemoveFromBlocklist(body.Pattern); err != nil {
+			if err := s.RemoveFromBlacklist(body.Pattern); err != nil {
 				http.Error(w, `{"error":"remove failed"}`, http.StatusInternalServerError)
 				return
 			}
@@ -829,7 +874,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				case <-readDone:
 					return
 				case <-statusTicker.C:
-					indexed, pending, err := s.GetStatus()
+					_, indexed, pending, err := s.GetStatus()
 					if err != nil {
 						return
 					}
@@ -932,25 +977,23 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 
 			// Group rows by pageID preserving DESC order, collect chunk texts per page.
 			type pageEntry struct {
-				pageID   int64
-				url      string
-				title    string
-				domain   string
-				visitTs  int64
-				starRank int
-				texts    []string
+				pageID  int64
+				url     string
+				title   string
+				domain  string
+				visitTs int64
+				texts   []string
 			}
 			pageMap := make(map[int64]*pageEntry)
 			pageOrder := make([]int64, 0)
 			for _, row := range histRows {
 				if _, ok := pageMap[row.PageID]; !ok {
 					pageMap[row.PageID] = &pageEntry{
-						pageID:   row.PageID,
-						url:      row.URL,
-						title:    row.Title,
-						domain:   row.Domain,
-						visitTs:  row.VisitTs,
-						starRank: row.StarRank,
+						pageID:  row.PageID,
+						url:     row.URL,
+						title:   row.Title,
+						domain:  row.Domain,
+						visitTs: row.VisitTs,
 					}
 					pageOrder = append(pageOrder, row.PageID)
 				}
@@ -966,7 +1009,6 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Title    string   `json:"title"`
 				Domain   string   `json:"domain"`
 				VisitTs  int64    `json:"visitTs"`
-				StarRank int      `json:"starRank"`
 				Keywords []string `json:"keywords"`
 			}
 			pages := make([]histPageJSON, 0, len(pageOrder))
@@ -984,7 +1026,6 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 					Title:    pe.title,
 					Domain:   pe.domain,
 					VisitTs:  pe.visitTs,
-					StarRank: pe.starRank,
 					Keywords: kwStrs,
 				})
 			}

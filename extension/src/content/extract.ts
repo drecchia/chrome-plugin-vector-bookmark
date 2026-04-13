@@ -1,4 +1,6 @@
 import { Readability } from '@mozilla/readability';
+import type { PageMeta } from '../../../proto/types';
+import { DEFAULT_DWELL_MS } from '../background/native-bridge';
 
 declare global {
 	interface Window {
@@ -24,7 +26,34 @@ function hasSensitiveInputs(): boolean {
 	);
 }
 
-function extract(starRank = false): { ok: boolean; error?: string } {
+function getMeta(nameOrProp: string, isProperty = false): string {
+	const selector = isProperty
+		? `meta[property="${nameOrProp}"]`
+		: `meta[name="${nameOrProp}"]`;
+	return (
+		document.querySelector(selector)?.getAttribute('content')?.trim() ?? ''
+	);
+}
+
+function extractMeta(): PageMeta {
+	const meta: PageMeta = {};
+	const desc = getMeta('description');
+	if (desc) meta.description = desc;
+	const kw = getMeta('keywords');
+	if (kw) meta.keywords = kw;
+	const ogTitle = getMeta('og:title', true);
+	if (ogTitle) meta.ogTitle = ogTitle;
+	const ogDesc = getMeta('og:description', true);
+	if (ogDesc) meta.ogDescription = ogDesc;
+	const ogImg = getMeta('og:image', true);
+	if (ogImg) meta.ogImage = ogImg;
+	const author = getMeta('author');
+	if (author) meta.author = author;
+	return meta;
+}
+
+// Force-extract: used by manual index (popup_force_index / force_extract message).
+function extract(): { ok: boolean; error?: string } {
 	if (hasSensitiveInputs()) return { ok: false, error: 'sensitive page' };
 	const article = new Readability(
 		document.cloneNode(true) as Document,
@@ -37,7 +66,7 @@ function extract(starRank = false): { ok: boolean; error?: string } {
 		title: article.title || document.title,
 		text: article.textContent,
 		dwellMs: 0,
-		starRank,
+		meta: extractMeta(),
 	});
 	return { ok: true };
 }
@@ -47,10 +76,23 @@ function extract(starRank = false): { ok: boolean; error?: string } {
 if (!window.__vbm_cs) {
 	window.__vbm_cs = true;
 
+	const TICK_MS = 500;
+
+	let dwellThreshold = DEFAULT_DWELL_MS;
+	// Read user-configured threshold from storage; falls back to default if unavailable.
+	chrome.storage.local
+		.get('vbmDwellMs')
+		.then((r) => {
+			const v = r.vbmDwellMs as number | undefined;
+			if (v && v > 0) dwellThreshold = v;
+		})
+		.catch(() => {});
+
 	let dwellMs = 0;
 	let lastVisible =
 		document.visibilityState === 'visible' ? Date.now() : null;
 	let sent = false;
+	let dwellStartedSent = false;
 
 	function accumulateDwell() {
 		if (lastVisible !== null) {
@@ -70,6 +112,14 @@ if (!window.__vbm_cs) {
 		}
 	});
 
+	// Hot-update threshold when the user changes it in the popup.
+	chrome.storage.onChanged.addListener((changes) => {
+		if (changes.vbmDwellMs) {
+			const v = changes.vbmDwellMs.newValue as number | undefined;
+			dwellThreshold = v && v > 0 ? v : DEFAULT_DWELL_MS;
+		}
+	});
+
 	const timer = setInterval(() => {
 		// Stop cleanly if extension was reloaded — avoids the TypeError.
 		if (!chrome.runtime?.id) {
@@ -78,26 +128,26 @@ if (!window.__vbm_cs) {
 		}
 		if (sent) return;
 		accumulateDwell();
-		if (dwellMs >= 30_000) {
+		if (!dwellStartedSent && dwellMs > 0) {
+			dwellStartedSent = true;
+			runtimeSend({ type: 'dwell_started' });
+		}
+		if (dwellMs >= dwellThreshold) {
 			if (hasSensitiveInputs()) {
 				runtimeSend({ type: 'page_sensitive' });
 				return;
 			}
-			const article = new Readability(
-				document.cloneNode(true) as Document,
-			).parse();
-			if (!article?.textContent || article.textContent.length < 200)
-				return;
 			sent = true;
+			// Record visit: URL + meta tags only — no deep indexing.
 			runtimeSend({
-				type: 'page_viewed',
+				type: 'page_visited',
 				url: location.href,
-				title: article.title || document.title,
-				text: article.textContent,
+				title: document.title,
 				dwellMs,
+				meta: extractMeta(),
 			});
 		}
-	}, 5_000);
+	}, TICK_MS);
 
 	document.addEventListener('focusin', (e) => {
 		const el = e.target as HTMLElement;
@@ -111,9 +161,9 @@ if (!window.__vbm_cs) {
 
 	// Force index: message from service worker bypasses dwell timer.
 	chrome.runtime.onMessage.addListener(
-		(msg: { type: string; starRank?: boolean }, _sender, sendResponse) => {
+		(msg: { type: string }, _sender, sendResponse) => {
 			if (msg.type !== 'force_extract') return;
-			const result = extract(msg.starRank ?? false);
+			const result = extract();
 			if (result.ok) sent = true;
 			sendResponse(result);
 		},

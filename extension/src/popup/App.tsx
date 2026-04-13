@@ -3,15 +3,11 @@ import type { StatusResponse, ForgetRequest } from '../../../proto/types';
 import {
 	DEFAULT_HOST,
 	DEFAULT_PORT,
+	DEFAULT_DWELL_MS,
 	saveDaemonConfig,
-	normaliseBlocklistEntry,
+	saveDwellThreshold,
 } from '../background/native-bridge';
-import {
-	reindex,
-	getReindexStatus,
-	addToBlocklist,
-	removeFromBlocklist,
-} from '../background/daemon-client';
+import { reindex, getReindexStatus } from '../background/daemon-client';
 
 export default function App() {
 	const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -23,10 +19,10 @@ export default function App() {
 	const [showSettings, setShowSettings] = useState(false);
 	const [host, setHost] = useState(DEFAULT_HOST);
 	const [port, setPort] = useState(String(DEFAULT_PORT));
+	const [dwellSecs, setDwellSecs] = useState(String(DEFAULT_DWELL_MS / 1000));
+	const [pageExists, setPageExists] = useState<boolean | null>(null);
 	const [pageIndexed, setPageIndexed] = useState<boolean | null>(null);
 	const [currentTabUrl, setCurrentTabUrl] = useState<string | null>(null);
-	const [isCurrentDomainBlocked, setIsCurrentDomainBlocked] = useState(false);
-	const [isUserBlacklisted, setIsUserBlacklisted] = useState(false);
 	const [reindexProgress, setReindexProgress] = useState<{
 		running: boolean;
 		done: number;
@@ -35,10 +31,15 @@ export default function App() {
 	const reindexPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
 	useEffect(() => {
-		chrome.storage.local.get(['vbmHost', 'vbmPort'], (result) => {
-			if (result.vbmHost) setHost(result.vbmHost as string);
-			if (result.vbmPort) setPort(String(result.vbmPort));
-		});
+		chrome.storage.local.get(
+			['vbmHost', 'vbmPort', 'vbmDwellMs'],
+			(result) => {
+				if (result.vbmHost) setHost(result.vbmHost as string);
+				if (result.vbmPort) setPort(String(result.vbmPort));
+				if (result.vbmDwellMs)
+					setDwellSecs(String((result.vbmDwellMs as number) / 1000));
+			},
+		);
 	}, []);
 
 	useEffect(() => {
@@ -60,24 +61,11 @@ export default function App() {
 				!url.startsWith('chrome-extension://')
 			) {
 				chrome.runtime.sendMessage(
-					{ type: 'popup_page_exists' },
+					{ type: 'popup_page_status' },
 					(res) => {
 						if (chrome.runtime.lastError) return;
+						setPageExists(res?.exists ?? false);
 						setPageIndexed(res?.indexed ?? false);
-					},
-				);
-				chrome.runtime.sendMessage(
-					{ type: 'popup_is_blocked' },
-					(res) => {
-						if (chrome.runtime.lastError) return;
-						setIsCurrentDomainBlocked(res?.blocked ?? false);
-					},
-				);
-				chrome.runtime.sendMessage(
-					{ type: 'popup_is_user_blocked' },
-					(res) => {
-						if (chrome.runtime.lastError) return;
-						setIsUserBlacklisted(res?.blocked ?? false);
 					},
 				);
 			}
@@ -118,6 +106,7 @@ export default function App() {
 			if (chrome.runtime.lastError) return;
 			if (res?.ok) {
 				flash('Removed');
+				setPageExists(false);
 				setPageIndexed(false);
 			} else {
 				flash(res?.error ?? 'Failed', false);
@@ -170,58 +159,17 @@ export default function App() {
 			.catch(() => flash('Re-embed failed', false));
 	}
 
-	function handleToggleBlacklist() {
-		chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-			const url = tabs[0]?.url;
-			if (
-				!url ||
-				url.startsWith('chrome://') ||
-				url.startsWith('chrome-extension://')
-			) {
-				flash('Cannot manage this page type', false);
-				return;
-			}
-			try {
-				const pattern = normaliseBlocklistEntry(new URL(url).hostname);
-				if (isUserBlacklisted) {
-					removeFromBlocklist(pattern)
-						.then(() => {
-							setIsUserBlacklisted(false);
-							setIsCurrentDomainBlocked(false);
-							flash(`${pattern} removed from blacklist`);
-						})
-						.catch(() => flash('Remove failed', false));
-				} else {
-					addToBlocklist(pattern)
-						.then(() => {
-							setIsUserBlacklisted(true);
-							setIsCurrentDomainBlocked(true);
-							flash(`${pattern} blacklisted`);
-						})
-						.catch(() => flash('Blacklist failed', false));
-				}
-			} catch {
-				flash('Invalid URL', false);
-			}
-		});
-	}
-
-	function handleStarIndex() {
-		chrome.runtime.sendMessage(
-			{ type: 'popup_force_index_star' },
-			(res) => {
-				if (chrome.runtime.lastError) return;
-				if (res?.ok) flash('Indexed as reference ⭐');
-				else flash(res?.error ?? 'Could not index page', false);
-			},
-		);
-	}
-
 	function handleSaveConfig() {
 		const p = parseInt(port, 10);
 		if (!host.trim() || isNaN(p) || p < 1 || p > 65535) return;
-		saveDaemonConfig({ host: host.trim(), port: p }).then(() => {
-			flash('Saved — reload extension to reconnect');
+		const d = parseFloat(dwellSecs);
+		const dwellMs =
+			isNaN(d) || d < 1 ? DEFAULT_DWELL_MS : Math.round(d * 1000);
+		Promise.all([
+			saveDaemonConfig({ host: host.trim(), port: p }),
+			saveDwellThreshold(dwellMs),
+		]).then(() => {
+			flash('Saved');
 			setShowSettings(false);
 		});
 	}
@@ -444,6 +392,28 @@ export default function App() {
 							</button>
 						</div>
 					</div>
+					<div>
+						<div style={s.label}>Dwell time (seconds)</div>
+						<div style={s.row}>
+							<input
+								style={s.input}
+								type="number"
+								min="1"
+								step="1"
+								value={dwellSecs}
+								onChange={(e) => setDwellSecs(e.target.value)}
+								onKeyDown={(e) =>
+									e.key === 'Enter' && handleSaveConfig()
+								}
+							/>
+							<button
+								style={s.btnGray}
+								onClick={handleSaveConfig}
+							>
+								Save
+							</button>
+						</div>
+					</div>
 					{(status?.indexed ?? 0) > 0 && (
 						<button
 							style={{ ...s.indexBtn, color: '#6366f1' }}
@@ -500,7 +470,10 @@ export default function App() {
 			{status && (
 				<div style={s.stat}>
 					<span>
-						<strong>{status.indexed}</strong> pages indexed
+						<strong>{status.visited}</strong> visited
+					</span>
+					<span>
+						<strong>{status.indexed}</strong> indexed
 					</span>
 					{status.pending > 0 && (
 						<span>
@@ -543,46 +516,11 @@ export default function App() {
 			{msg && <div style={s.flashBox(msg.ok)}>{msg.text}</div>}
 
 			{/* Index this page */}
-			<div style={{ display: 'flex', gap: '5px' }}>
-				<button
-					style={{
-						...s.indexBtn,
-						flex: 1,
-						width: 'auto',
-						whiteSpace: 'nowrap',
-						opacity: isCurrentDomainBlocked ? 0.45 : 1,
-					}}
-					onClick={handleForceIndex}
-					disabled={isCurrentDomainBlocked}
-					title={
-						isCurrentDomainBlocked
-							? 'This domain is blocked'
-							: undefined
-					}
-				>
-					Index this page now
-				</button>
-				<button
-					style={{
-						...s.indexBtn,
-						width: 'auto',
-						flexShrink: 0,
-						padding: '7px 10px',
-						opacity: isCurrentDomainBlocked ? 0.45 : 1,
-					}}
-					onClick={handleStarIndex}
-					disabled={isCurrentDomainBlocked}
-					title={
-						isCurrentDomainBlocked
-							? 'This domain is blocked'
-							: 'Index as reference (boosts rank)'
-					}
-				>
-					⭐
-				</button>
-			</div>
+			<button style={s.indexBtn} onClick={handleForceIndex}>
+				Index this page now
+			</button>
 
-			{/* Page indexed indicator */}
+			{/* Page status indicator */}
 			{pageIndexed === true && (
 				<div
 					style={{
@@ -613,35 +551,20 @@ export default function App() {
 					</button>
 				</div>
 			)}
-
-			<div style={s.divider} />
-
-			{/* Blacklist toggle */}
-			<button
-				style={{
-					...s.indexBtn,
-					color: isUserBlacklisted
-						? '#dc2626'
-						: isCurrentDomainBlocked
-							? '#9ca3af'
-							: '#374151',
-				}}
-				onClick={handleToggleBlacklist}
-				disabled={isCurrentDomainBlocked && !isUserBlacklisted}
-				title={
-					isUserBlacklisted
-						? 'Remove from blacklist'
-						: isCurrentDomainBlocked
-							? 'Blocked by built-in denylist'
-							: 'Add domain to blacklist (manage in Open UI → Blacklist)'
-				}
-			>
-				{isUserBlacklisted
-					? 'Remove from blacklist'
-					: isCurrentDomainBlocked
-						? 'Domain is blocked'
-						: 'Blacklist this site'}
-			</button>
+			{pageExists === true && pageIndexed === false && (
+				<div
+					style={{
+						fontSize: '12px',
+						color: '#1e40af',
+						background: '#eff6ff',
+						border: '1px solid #bfdbfe',
+						borderRadius: '4px',
+						padding: '5px 8px',
+					}}
+				>
+					● Visited — not yet indexed
+				</div>
+			)}
 
 			{/* Footer */}
 			<div style={s.footer}>@recall in address bar to search</div>

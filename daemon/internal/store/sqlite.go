@@ -34,15 +34,24 @@ type Page struct {
 	ModelVer string
 }
 
-// IngestRequest holds data for ingesting a page.
-type IngestRequest struct {
+// VisitRequest holds data for recording a passive page visit (no text/embedding).
+type VisitRequest struct {
 	URL      string
 	Title    string
-	Text     string
 	VisitTs  int64
 	DwellMs  int64
 	Domain   string
-	StarRank bool
+	MetaJSON string
+}
+
+// IngestRequest holds data for ingesting a page (manual full-index).
+type IngestRequest struct {
+	URL     string
+	Title   string
+	Text    string
+	VisitTs int64
+	DwellMs int64
+	Domain  string
 }
 
 // SearchResult holds a single search hit.
@@ -72,6 +81,8 @@ CREATE TABLE IF NOT EXISTS pages (
     visit_ts INTEGER NOT NULL,
     dwell_ms INTEGER NOT NULL DEFAULT 0,
     model_ver TEXT NOT NULL DEFAULT 'stub-v0',
+    indexed INTEGER NOT NULL DEFAULT 0,
+    meta_json TEXT DEFAULT '',
     created_at INTEGER NOT NULL
 );
 
@@ -185,7 +196,7 @@ INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
 `
 	const schemaV3 = `ALTER TABLE pages ADD COLUMN star_rank INTEGER NOT NULL DEFAULT 0;`
 	const schemaV4 = `
-CREATE TABLE IF NOT EXISTS blocklist (
+CREATE TABLE IF NOT EXISTS blacklist (
     pattern    TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL
 );`
@@ -222,6 +233,28 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// RecordVisit upserts a page with metadata only (no text, no chunking, no embedding).
+func (s *Store) RecordVisit(req VisitRequest) error {
+	urlHash := chunk.Hash(req.URL)
+	now := time.Now().UnixMilli()
+
+	_, err := s.db.Exec(`
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, meta_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'stub-v0', 0, ?, ?)
+		ON CONFLICT(url_hash) DO UPDATE SET
+			title=excluded.title,
+			domain=excluded.domain,
+			visit_ts=excluded.visit_ts,
+			dwell_ms=excluded.dwell_ms,
+			meta_json=excluded.meta_json,
+			indexed=MAX(indexed, 0)
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, req.MetaJSON, now)
+	if err != nil {
+		return fmt.Errorf("record visit: %w", err)
+	}
+	return nil
+}
+
 // Ingest chunks and stores a page, embedding each chunk.
 func (s *Store) Ingest(req IngestRequest) error {
 	chunks := chunk.SplitIntoChunks(req.Text)
@@ -238,23 +271,18 @@ func (s *Store) Ingest(req IngestRequest) error {
 	}
 	defer tx.Rollback()
 
-	starRank := 0
-	if req.StarRank {
-		starRank = 1
-	}
-
-	// Upsert page
+	// Upsert page — set indexed=1 since this is a full ingest with text.
 	res, err := tx.Exec(`
-		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, star_rank, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
 		ON CONFLICT(url_hash) DO UPDATE SET
 			title=excluded.title,
 			domain=excluded.domain,
 			visit_ts=excluded.visit_ts,
 			dwell_ms=excluded.dwell_ms,
 			model_ver=excluded.model_ver,
-			star_rank=MAX(star_rank, excluded.star_rank)
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), starRank, now)
+			indexed=1
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), now)
 	if err != nil {
 		return fmt.Errorf("upsert page: %w", err)
 	}
@@ -427,7 +455,7 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 	placeholders := strings.Repeat("?,", len(ids))
 	placeholders = placeholders[:len(placeholders)-1]
 	joinQuery := fmt.Sprintf(`
-		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts, p.star_rank
+		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts
 		FROM chunks c JOIN pages p ON c.page_id = p.id
 		WHERE c.id IN (%s)
 	`, placeholders)
@@ -439,18 +467,17 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 
 	// Collect into map to preserve RRF order after JOIN.
 	type rowData struct {
-		text     string
-		url      string
-		title    string
-		domain   string
-		visitTs  int64
-		starRank int
+		text    string
+		url     string
+		title   string
+		domain  string
+		visitTs int64
 	}
 	rowMap := make(map[int64]rowData, len(entries))
 	for joinRows.Next() {
 		var id int64
 		var rd rowData
-		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs, &rd.starRank); err != nil {
+		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs); err != nil {
 			continue
 		}
 		rowMap[id] = rd
@@ -462,10 +489,6 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 		if !ok {
 			continue
 		}
-		score := e.score
-		if rd.starRank == 1 {
-			score *= 1.5 // CR-010: starred pages rank earlier
-		}
 		// P2-05: 400 chars gives better context for technical docs.
 		snippet := rd.text
 		if len(snippet) > 400 {
@@ -476,24 +499,22 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 			Title:   rd.title,
 			Snippet: snippet,
 			VisitTs: rd.visitTs,
-			Score:   score,
+			Score:   e.score,
 			Domain:  rd.domain,
 		})
 	}
-	// Re-sort after star_rank boost may have changed relative order.
 	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 	return results, nil
 }
 
 // HistoryRow is a raw row returned by GetPageHistoryRows.
 type HistoryRow struct {
-	PageID   int64
-	URL      string
-	Title    string
-	Domain   string
-	VisitTs  int64
-	StarRank int
-	Text     string
+	PageID  int64
+	URL     string
+	Title   string
+	Domain  string
+	VisitTs int64
+	Text    string
 }
 
 // GetPageHistoryRows returns chunk texts for the top `limit` pages visited in
@@ -501,9 +522,9 @@ type HistoryRow struct {
 // extracts keywords per page.
 func (s *Store) GetPageHistoryRows(fromMs, toMs int64, limit int) ([]HistoryRow, error) {
 	rows, err := s.db.Query(`
-		SELECT p.id, p.url, p.title, p.domain, p.visit_ts, p.star_rank, c.text
-		FROM chunks c
-		JOIN pages p ON c.page_id = p.id
+		SELECT p.id, p.url, p.title, p.domain, p.visit_ts, COALESCE(c.text, '')
+		FROM pages p
+		LEFT JOIN chunks c ON c.page_id = p.id
 		WHERE p.id IN (
 			SELECT id FROM pages
 			WHERE visit_ts >= ? AND visit_ts < ?
@@ -519,7 +540,7 @@ func (s *Store) GetPageHistoryRows(fromMs, toMs int64, limit int) ([]HistoryRow,
 	var out []HistoryRow
 	for rows.Next() {
 		var r HistoryRow
-		if err := rows.Scan(&r.PageID, &r.URL, &r.Title, &r.Domain, &r.VisitTs, &r.StarRank, &r.Text); err != nil {
+		if err := rows.Scan(&r.PageID, &r.URL, &r.Title, &r.Domain, &r.VisitTs, &r.Text); err != nil {
 			continue
 		}
 		out = append(out, r)
@@ -693,19 +714,25 @@ func (s *Store) Cleanup(ttlDays int) (int64, error) {
 	return n, nil
 }
 
-// PageExists reports whether a URL has already been indexed.
-func (s *Store) PageExists(rawURL string) (bool, error) {
+// PageStatus returns whether a page exists and whether it has been fully indexed.
+func (s *Store) PageStatus(rawURL string) (exists bool, indexed bool, err error) {
 	hash := chunk.Hash(rawURL)
-	var n int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM pages WHERE url_hash = ?`, hash).Scan(&n)
-	return n > 0, err
+	var idx int
+	err = s.db.QueryRow(`SELECT indexed FROM pages WHERE url_hash = ?`, hash).Scan(&idx)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, idx == 1, nil
 }
 
-// GetBlocklist returns all patterns in the user-managed domain blocklist.
-func (s *Store) GetBlocklist() ([]string, error) {
-	rows, err := s.db.Query(`SELECT pattern FROM blocklist ORDER BY created_at ASC`)
+// GetBlacklist returns all patterns in the user-managed domain blacklist.
+func (s *Store) GetBlacklist() ([]string, error) {
+	rows, err := s.db.Query(`SELECT pattern FROM blacklist ORDER BY created_at ASC`)
 	if err != nil {
-		return nil, fmt.Errorf("get blocklist: %w", err)
+		return nil, fmt.Errorf("get blacklist: %w", err)
 	}
 	defer rows.Close()
 	var patterns []string
@@ -719,24 +746,28 @@ func (s *Store) GetBlocklist() ([]string, error) {
 	return patterns, nil
 }
 
-// AddToBlocklist adds a pattern to the blocklist (idempotent).
-func (s *Store) AddToBlocklist(pattern string) error {
+// AddToBlacklist adds a pattern to the blacklist (idempotent).
+func (s *Store) AddToBlacklist(pattern string) error {
 	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO blocklist (pattern, created_at) VALUES (?, ?)`,
+		`INSERT OR IGNORE INTO blacklist (pattern, created_at) VALUES (?, ?)`,
 		pattern, time.Now().UnixMilli(),
 	)
 	return err
 }
 
-// RemoveFromBlocklist removes a pattern from the blocklist.
-func (s *Store) RemoveFromBlocklist(pattern string) error {
-	_, err := s.db.Exec(`DELETE FROM blocklist WHERE pattern = ?`, pattern)
+// RemoveFromBlacklist removes a pattern from the blacklist.
+func (s *Store) RemoveFromBlacklist(pattern string) error {
+	_, err := s.db.Exec(`DELETE FROM blacklist WHERE pattern = ?`, pattern)
 	return err
 }
 
 // GetStatus returns the number of indexed pages and pending queue items.
-func (s *Store) GetStatus() (indexed int, pending int, err error) {
+func (s *Store) GetStatus() (visited int, indexed int, pending int, err error) {
 	row := s.db.QueryRow(`SELECT COUNT(*) FROM pages`)
+	if err = row.Scan(&visited); err != nil {
+		return
+	}
+	row = s.db.QueryRow(`SELECT COUNT(*) FROM pages WHERE indexed = 1`)
 	if err = row.Scan(&indexed); err != nil {
 		return
 	}

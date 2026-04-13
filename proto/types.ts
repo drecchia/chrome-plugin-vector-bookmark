@@ -1,4 +1,25 @@
-// ---- Ingest ----
+// ---- Page Meta (HTML meta tags) ----
+export interface PageMeta {
+	description?: string;
+	keywords?: string;
+	ogTitle?: string;
+	ogDescription?: string;
+	ogImage?: string;
+	author?: string;
+}
+
+// ---- Visit (passive history, no text extraction) ----
+export interface VisitRequest {
+	url: string;
+	title: string;
+	/** Unix milliseconds */
+	visitTs: number;
+	dwellMs: number;
+	domain: string;
+	meta?: PageMeta;
+}
+
+// ---- Ingest (manual full-index with text) ----
 export interface IngestRequest {
 	url: string;
 	title: string;
@@ -7,8 +28,6 @@ export interface IngestRequest {
 	visitTs: number;
 	dwellMs: number;
 	domain: string;
-	/** If true, page is marked as a reference (1.5× search score boost). */
-	starRank?: boolean;
 }
 
 // ---- Search ----
@@ -43,6 +62,7 @@ export interface ForgetRequest {
 
 // ---- Status ----
 export interface StatusResponse {
+	visited: number;
 	indexed: number;
 	pending: number;
 	version: string;
@@ -63,4 +83,15 @@ export interface WsStatusMessage {
 export interface DaemonState {
 	host: string;
 	port: number;
+}
+
+// ---- Page status ----
+export interface PageStatusResponse {
+	exists: boolean;
+	indexed: boolean;
+}
+
+// ---- Content script → SW signals ----
+export interface DwellStartedMessage {
+	type: 'dwell_started';
 }
