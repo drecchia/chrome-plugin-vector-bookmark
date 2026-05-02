@@ -52,6 +52,16 @@ type IngestRequest struct {
 	VisitTs int64
 	DwellMs int64
 	Domain  string
+	Tags    []string
+	// SetTags=true replaces the page's tag set with Tags exactly (delete + insert).
+	// SetTags=false (default) merges Tags into existing (INSERT OR IGNORE only).
+	SetTags bool
+}
+
+// TagCount holds a tag and the number of pages that carry it.
+type TagCount struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
 }
 
 // SearchResult holds a single search hit.
@@ -200,15 +210,35 @@ CREATE TABLE IF NOT EXISTS blacklist (
     pattern    TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL
 );`
+	// schemaV5: drop unused star_rank column (never referenced by any query).
+	// DROP COLUMN requires SQLite ≥3.35; modernc.org/sqlite ships a newer engine.
+	// Wrapped in a best-effort block — if a fresh DB was created after V3 was
+	// rolled back, the column may not exist; tolerate that silently.
+	const schemaV5 = `ALTER TABLE pages DROP COLUMN star_rank;`
+	// schemaV6: index chunks(page_id) for fast cascade/joins.
+	const schemaV6 = `CREATE INDEX IF NOT EXISTS idx_chunks_page_id ON chunks(page_id);`
+	// schemaV7: per-page tags for user curation (read-later, reference, …).
+	const schemaV7 = `
+CREATE TABLE IF NOT EXISTS page_tags (
+    page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    tag        TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (page_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_page_tags_tag ON page_tags(tag);`
 
 	migrations := []struct {
-		version int
-		sql     string
+		version    int
+		sql        string
+		ignoreErrs bool
 	}{
-		{1, schemaV1},
-		{2, schemaV2},
-		{3, schemaV3},
-		{4, schemaV4},
+		{1, schemaV1, false},
+		{2, schemaV2, false},
+		{3, schemaV3, false},
+		{4, schemaV4, false},
+		{5, schemaV5, true}, // column may already be absent on recent fresh DBs
+		{6, schemaV6, false},
+		{7, schemaV7, false},
 	}
 
 	for _, m := range migrations {
@@ -216,7 +246,11 @@ CREATE TABLE IF NOT EXISTS blacklist (
 			continue
 		}
 		if _, err := db.Exec(m.sql); err != nil {
-			return fmt.Errorf("migrate to v%d: %w", m.version, err)
+			if m.ignoreErrs {
+				slog.Warn("migration tolerated error", "version", m.version, "err", err)
+			} else {
+				return fmt.Errorf("migrate to v%d: %w", m.version, err)
+			}
 		}
 		if _, err := db.Exec(
 			`INSERT INTO schema_versions (version, applied_at) VALUES (?, ?)`,
@@ -296,6 +330,48 @@ func (s *Store) Ingest(req IngestRequest) error {
 		}
 	}
 
+	// Normalize requested tags (dedup, drop empties).
+	wantTags := make(map[string]struct{}, len(req.Tags))
+	for _, t := range req.Tags {
+		if nt := normalizeTag(t); nt != "" {
+			wantTags[nt] = struct{}{}
+		}
+	}
+
+	if req.SetTags {
+		// Set-mode: the requested list becomes the authoritative final list.
+		// Delete tags not in wantTags, then INSERT OR IGNORE the rest.
+		if len(wantTags) == 0 {
+			if _, err := tx.Exec(`DELETE FROM page_tags WHERE page_id = ?`, pageID); err != nil {
+				return fmt.Errorf("clear tags: %w", err)
+			}
+		} else {
+			args := make([]any, 0, len(wantTags)+1)
+			args = append(args, pageID)
+			placeholders := make([]string, 0, len(wantTags))
+			for t := range wantTags {
+				placeholders = append(placeholders, "?")
+				args = append(args, t)
+			}
+			delSQL := fmt.Sprintf(
+				`DELETE FROM page_tags WHERE page_id = ? AND tag NOT IN (%s)`,
+				strings.Join(placeholders, ","),
+			)
+			if _, err := tx.Exec(delSQL, args...); err != nil {
+				return fmt.Errorf("delete stale tags: %w", err)
+			}
+		}
+	}
+
+	for t := range wantTags {
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO page_tags (page_id, tag, created_at) VALUES (?, ?, ?)`,
+			pageID, t, now,
+		); err != nil {
+			return fmt.Errorf("insert tag %q: %w", t, err)
+		}
+	}
+
 	for _, c := range chunks {
 		vec, err := s.embedder.Embed(c.Text)
 		if err != nil {
@@ -323,33 +399,118 @@ func (s *Store) Ingest(req IngestRequest) error {
 	return tx.Commit()
 }
 
+// PreparedChunk is a chunk with its embedding already computed.
+// Produced by queue workers; consumed by the single DB-writer goroutine.
+type PreparedChunk struct {
+	Index int
+	Text  string
+	Hash  string
+	Vec   []float32
+}
+
+// PreparedIngest bundles a page + pre-embedded chunks for atomic DB write.
+type PreparedIngest struct {
+	Req    IngestRequest
+	Chunks []PreparedChunk
+}
+
+// Embedder returns the active embedder — exposed for queue workers that need
+// to embed chunks off the hot write path.
+func (s *Store) Embedder() embed.Embedder { return s.embedder }
+
+// IngestPrepared writes a pre-embedded PreparedIngest in a single transaction.
+// No embedding happens here — this runs on the single DB-writer goroutine.
+func (s *Store) IngestPrepared(p PreparedIngest) error {
+	if len(p.Chunks) == 0 {
+		return nil
+	}
+	req := p.Req
+	urlHash := chunk.Hash(req.URL)
+	now := time.Now().UnixMilli()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+		ON CONFLICT(url_hash) DO UPDATE SET
+			title=excluded.title,
+			domain=excluded.domain,
+			visit_ts=excluded.visit_ts,
+			dwell_ms=excluded.dwell_ms,
+			model_ver=excluded.model_ver,
+			indexed=1
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), now)
+	if err != nil {
+		return fmt.Errorf("upsert page: %w", err)
+	}
+	pageID, err := res.LastInsertId()
+	if err != nil || pageID == 0 {
+		row := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash)
+		if err2 := row.Scan(&pageID); err2 != nil {
+			return fmt.Errorf("get page id: %w", err2)
+		}
+	}
+
+	for _, c := range p.Chunks {
+		blob := embed.EncodeEmbedding(c.Vec)
+		cres, err := tx.Exec(`
+			INSERT OR IGNORE INTO chunks (page_id, chunk_idx, text, text_hash, embedding, model_ver)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, pageID, c.Index, c.Text, c.Hash, blob, s.embedder.Version())
+		if err != nil {
+			return fmt.Errorf("insert chunk %d: %w", c.Index, err)
+		}
+		if n, _ := cres.RowsAffected(); n > 0 {
+			chunkID, _ := cres.LastInsertId()
+			if _, err := tx.Exec(`INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)`, chunkID, c.Text); err != nil {
+				return fmt.Errorf("fts insert chunk %d: %w", c.Index, err)
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
 type chunkRow struct {
 	id     int64
 	text   string
 	pageID int64
 }
 
-// Search performs hybrid BM25 + cosine RRF search.
-func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
+// Search performs hybrid BM25 + cosine RRF search. If tag is non-empty,
+// candidates are restricted to pages carrying that tag.
+func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, error) {
 	if limit <= 0 {
 		limit = 5
 	}
 	if limit > 20 {
 		limit = 20
 	}
+	tag = normalizeTag(tag)
 
 	// Step 1: BM25 via FTS5
 	bm25Chunks := []chunkRow{}
 	bm25Ranks := map[int64]int{}
 
-	rows, err := s.db.Query(`
+	bm25SQL := `
 		SELECT c.id, c.text, c.page_id, bm25(chunks_fts) as bm25_score
 		FROM chunks_fts
 		JOIN chunks c ON c.id = chunks_fts.rowid
-		WHERE chunks_fts MATCH ?
+		WHERE chunks_fts MATCH ?`
+	bm25Args := []any{query}
+	if tag != "" {
+		bm25SQL += ` AND c.page_id IN (SELECT page_id FROM page_tags WHERE tag = ?)`
+		bm25Args = append(bm25Args, tag)
+	}
+	bm25SQL += `
 		ORDER BY bm25_score
-		LIMIT 50
-	`, query)
+		LIMIT 50`
+	rows, err := s.db.Query(bm25SQL, bm25Args...)
 	if err != nil && !strings.Contains(err.Error(), "no such table") {
 		return nil, fmt.Errorf("fts query: %w", err)
 	}
@@ -393,7 +554,13 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 			score  float32
 		}
 
-		allRows, err := s.db.Query(`SELECT id, text, page_id, embedding FROM chunks`)
+		denseSQL := `SELECT id, text, page_id, embedding FROM chunks`
+		var denseArgs []any
+		if tag != "" {
+			denseSQL += ` WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag = ?)`
+			denseArgs = append(denseArgs, tag)
+		}
+		allRows, err := s.db.Query(denseSQL, denseArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("load chunks: %w", err)
 		}
@@ -871,4 +1038,165 @@ func (s *Store) Export() ([]ExportPage, error) {
 		result = append(result, *pageMap[id])
 	}
 	return result, nil
+}
+
+// NormalizeTag is the exported entry point for the same normalization rules
+// used at ingest time. Callers outside the package (e.g. /tags/suggest in the
+// server) use this so suggested tags match ingest semantics exactly.
+func NormalizeTag(tag string) string { return normalizeTag(tag) }
+
+// normalizeTag lowercases, trims and validates a tag.
+// Returns "" if the tag is empty or contains only invalid characters.
+// Allowed: a-z, 0-9, '-', '_', spaces. Max length 64.
+func normalizeTag(tag string) string {
+	t := strings.ToLower(strings.TrimSpace(tag))
+	if t == "" {
+		return ""
+	}
+	if len(t) > 64 {
+		t = t[:64]
+	}
+	b := make([]byte, 0, len(t))
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ' {
+			b = append(b, c)
+		}
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// GetPageTags returns the tags currently assigned to the page identified by URL.
+// Returns an empty slice (not nil) when the page does not exist.
+func (s *Store) GetPageTags(rawURL string) ([]string, error) {
+	urlHash := chunk.Hash(rawURL)
+	rows, err := s.db.Query(`
+		SELECT pt.tag
+		FROM page_tags pt
+		JOIN pages p ON p.id = pt.page_id
+		WHERE p.url_hash = ?
+		ORDER BY pt.tag
+	`, urlHash)
+	if err != nil {
+		return nil, fmt.Errorf("get page tags: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("scan tag: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListTags returns all distinct tags with the count of pages per tag, sorted by tag.
+func (s *Store) ListTags() ([]TagCount, error) {
+	rows, err := s.db.Query(`
+		SELECT tag, COUNT(*) AS n
+		FROM page_tags
+		GROUP BY tag
+		ORDER BY tag ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list tags: %w", err)
+	}
+	defer rows.Close()
+	out := []TagCount{}
+	for rows.Next() {
+		var tc TagCount
+		if err := rows.Scan(&tc.Tag, &tc.Count); err != nil {
+			return nil, fmt.Errorf("scan tag: %w", err)
+		}
+		out = append(out, tc)
+	}
+	return out, rows.Err()
+}
+
+// TaggedPage holds a page row enriched with its tags for the /pages?tag= listing.
+type TaggedPage struct {
+	URL     string   `json:"url"`
+	Title   string   `json:"title"`
+	Domain  string   `json:"domain"`
+	VisitTs int64    `json:"visitTs"`
+	Tags    []string `json:"tags"`
+}
+
+// ListPagesByTag returns pages carrying the given tag, newest first, with all their tags.
+func (s *Store) ListPagesByTag(tag string, limit int) ([]TaggedPage, error) {
+	tag = normalizeTag(tag)
+	if tag == "" {
+		return []TaggedPage{}, nil
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`
+		SELECT p.id, p.url, p.title, p.domain, p.visit_ts
+		FROM pages p
+		JOIN page_tags pt ON pt.page_id = p.id
+		WHERE pt.tag = ?
+		ORDER BY p.visit_ts DESC
+		LIMIT ?
+	`, tag, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pages by tag: %w", err)
+	}
+	defer rows.Close()
+
+	type rowEntry struct {
+		id      int64
+		url     string
+		title   string
+		domain  string
+		visitTs int64
+	}
+	var entries []rowEntry
+	ids := []any{}
+	for rows.Next() {
+		var e rowEntry
+		if err := rows.Scan(&e.id, &e.url, &e.title, &e.domain, &e.visitTs); err != nil {
+			return nil, fmt.Errorf("scan tagged page: %w", err)
+		}
+		entries = append(entries, e)
+		ids = append(ids, e.id)
+	}
+	if len(entries) == 0 {
+		return []TaggedPage{}, nil
+	}
+
+	// Fetch all tags for the matched pages in one query.
+	tagsByPage := make(map[int64][]string, len(entries))
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	tagRows, err := s.db.Query(
+		fmt.Sprintf(`SELECT page_id, tag FROM page_tags WHERE page_id IN (%s) ORDER BY tag`, placeholders),
+		ids...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fetch tags: %w", err)
+	}
+	defer tagRows.Close()
+	for tagRows.Next() {
+		var pid int64
+		var t string
+		if err := tagRows.Scan(&pid, &t); err != nil {
+			continue
+		}
+		tagsByPage[pid] = append(tagsByPage[pid], t)
+	}
+
+	out := make([]TaggedPage, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, TaggedPage{
+			URL:     e.url,
+			Title:   e.title,
+			Domain:  e.domain,
+			VisitTs: e.visitTs,
+			Tags:    tagsByPage[e.id],
+		})
+	}
+	return out, nil
 }

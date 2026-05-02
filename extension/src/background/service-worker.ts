@@ -7,7 +7,10 @@ import {
 	pageStatus,
 	getBlacklist,
 	addToBlacklist,
+	listTags,
+	suggestTags,
 } from './daemon-client';
+import type { IngestMode, ExtractIntent } from '../../../proto/types';
 import {
 	normaliseBlacklistEntry,
 	getDaemonBase,
@@ -68,6 +71,16 @@ const BADGE_PRIORITY: Record<BadgeState, number> = {
 };
 const tabBadgeState = new Map<number, BadgeState>();
 
+// Pending ingest options stored when the popup triggers "Index this site now".
+// Consumed when the matching page_viewed arrives from the content script.
+// Keyed by tabId so concurrent extracts on different tabs don't clobber each other.
+interface PendingIngest {
+	mode: IngestMode;
+	tags: string[];
+	intent?: ExtractIntent;
+}
+const pendingIngest = new Map<number, PendingIngest>();
+
 function setBadge(tabId: number, state: BadgeState | 'clear'): void {
 	if (state === 'clear') {
 		tabBadgeState.delete(tabId);
@@ -114,6 +127,7 @@ async function updateTabBadge(tabId: number, url: string): Promise<void> {
 			signal: AbortSignal.timeout(2000),
 		});
 		if (!resp.ok) throw new Error('not ok');
+		markHealthy();
 	} catch {
 		setBadge(tabId, 'disconnected');
 		return;
@@ -136,6 +150,20 @@ async function updateTabBadge(tabId: number, url: string): Promise<void> {
 
 // P1-01: capture state lives in the service worker (survives popup open/close).
 let captureEnabled = true;
+
+// Track last successful daemon contact so the popup can show an offline banner
+// without every call hitting /healthz. Updated from any successful daemon call
+// (healthz, status, visit, ingest). `connected` = lastHealthyTs within window.
+let lastHealthyTs: number | null = null;
+const HEALTHY_WINDOW_MS = 15_000;
+function markHealthy() {
+	lastHealthyTs = Date.now();
+}
+function isConnected(): boolean {
+	return (
+		lastHealthyTs !== null && Date.now() - lastHealthyTs < HEALTHY_WINDOW_MS
+	);
+}
 
 // CR-008: user-managed domain blacklist (suffix match).
 let blockedDomains: string[] = [];
@@ -313,23 +341,39 @@ async function handlePageViewed(
 	// P2-10: strip tracking/session params from URL before indexing.
 	const cleanUrl = sanitizeUrl(msg.url);
 	try {
-		// Prepend meta fields so they are chunked and embedded alongside body text.
+		// Build a meta block (title + description/keywords/og/author).
 		const metaParts: string[] = [];
 		const m = msg.meta ?? {};
+		if (msg.title) metaParts.push(msg.title);
 		if (m.description) metaParts.push(`description: ${m.description}`);
 		if (m.keywords) metaParts.push(`keywords: ${m.keywords}`);
 		if (m.ogDescription) metaParts.push(`summary: ${m.ogDescription}`);
 		if (m.author) metaParts.push(`author: ${m.author}`);
-		const enrichedText = metaParts.length
-			? `${metaParts.join('\n')}\n\n${msg.text}`
-			: msg.text;
+		const metaText = metaParts.join('\n');
+
+		const pending =
+			tabId !== undefined ? pendingIngest.get(tabId) : undefined;
+		if (tabId !== undefined) pendingIngest.delete(tabId);
+		const mode: IngestMode = pending?.mode ?? 'full_text';
+		const tags = pending?.tags ?? [];
+
+		const text =
+			mode === 'meta_only'
+				? metaText
+				: metaText
+					? `${metaText}\n\n${msg.text}`
+					: msg.text;
+
 		await ingest({
 			url: cleanUrl,
 			title: msg.title,
-			text: enrichedText,
+			text,
 			visitTs: Date.now(),
 			dwellMs: msg.dwellMs,
 			domain: new URL(cleanUrl).hostname,
+			tags,
+			setTags: pending !== undefined,
+			mode,
 		});
 		if (tabId !== undefined) setBadge(tabId, 'indexed');
 	} catch {
@@ -339,7 +383,15 @@ async function handlePageViewed(
 
 chrome.runtime.onMessage.addListener(
 	(
-		msg: { type: string; req?: ForgetRequest; enabled?: boolean },
+		msg: {
+			type: string;
+			req?: ForgetRequest;
+			enabled?: boolean;
+			tags?: string[];
+			mode?: IngestMode;
+			manualText?: string;
+			intent?: ExtractIntent;
+		},
 		sender: chrome.runtime.MessageSender,
 		sendResponse: (response?: unknown) => void,
 	) => {
@@ -371,7 +423,8 @@ chrome.runtime.onMessage.addListener(
 
 		if (msg.type === 'popup_status') {
 			getStatus()
-				.then((status) =>
+				.then((status) => {
+					markHealthy();
 					sendResponse({
 						visited: status.visited,
 						indexed: status.indexed,
@@ -380,9 +433,17 @@ chrome.runtime.onMessage.addListener(
 						daemonPort: status.port,
 						captureEnabled,
 						embedderVersion: status.embedderVersion,
+						connected: true,
+						lastSeenTs: lastHealthyTs,
+					});
+				})
+				.catch((e) =>
+					sendResponse({
+						error: String(e),
+						connected: isConnected(),
+						lastSeenTs: lastHealthyTs,
 					}),
-				)
-				.catch((e) => sendResponse({ error: String(e) }));
+				);
 			return true;
 		}
 
@@ -416,6 +477,93 @@ chrome.runtime.onMessage.addListener(
 			return true;
 		}
 
+		if (msg.type === 'popup_list_tags') {
+			listTags()
+				.then((tags) => sendResponse({ tags }))
+				.catch(() => sendResponse({ tags: [] }));
+			return true;
+		}
+
+		// CR-0003: ask the content script for the page payload, then forward it
+		// to /tags/suggest. Doesn't touch ingest, badge, or pendingIngest.
+		if (msg.type === 'popup_suggest_tags') {
+			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+				const tab = tabs[0];
+				if (
+					!tab?.id ||
+					!tab.url ||
+					tab.url.startsWith('chrome://') ||
+					tab.url.startsWith('chrome-extension://')
+				) {
+					sendResponse({
+						ok: false,
+						error: 'Cannot suggest tags for this page type',
+					});
+					return;
+				}
+				const tabId = tab.id;
+				const ask = () => {
+					chrome.tabs.sendMessage(
+						tabId,
+						{ type: 'force_extract', intent: 'suggest_tags' },
+						(res) => {
+							if (chrome.runtime.lastError) {
+								sendResponse({
+									ok: false,
+									error: 'Failed — refresh the page and try again',
+								});
+								return;
+							}
+							if (!res?.ok || !res.payload) {
+								sendResponse({
+									ok: false,
+									error:
+										res?.error ?? 'Could not extract page',
+								});
+								return;
+							}
+							suggestTags(res.payload)
+								.then((data) => {
+									if (!data.tags || data.tags.length === 0) {
+										sendResponse({
+											ok: false,
+											error: 'Could not suggest tags — try again',
+										});
+										return;
+									}
+									sendResponse({
+										ok: true,
+										tags: data.tags,
+									});
+								})
+								.catch((e) =>
+									sendResponse({
+										ok: false,
+										error: String(
+											(e as Error).message ?? e,
+										),
+									}),
+								);
+						},
+					);
+				};
+				const files = (chrome.runtime.getManifest().content_scripts?.[0]
+					?.js ?? []) as string[];
+				if (!files.length) {
+					ask();
+					return;
+				}
+				chrome.scripting.executeScript(
+					{ target: { tabId }, files },
+					() => {
+						void chrome.runtime.lastError;
+						ask();
+					},
+				);
+			});
+			return true;
+		}
+
 		if (msg.type === 'popup_force_index') {
 			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 				const tab = tabs[0];
@@ -432,10 +580,55 @@ chrome.runtime.onMessage.addListener(
 					return;
 				}
 				const tabId = tab.id;
+				const intent = msg.intent;
+				// CR-0002: when an extraction intent is provided, the content
+				// script does the heavy lifting and the daemon sees mode=manual
+				// (stores text as-is, no LLM/Readability post-processing).
+				const mode: IngestMode = intent
+					? 'manual'
+					: (msg.mode ?? 'full_text');
+				const tags = msg.tags ?? [];
+
+				// Manual mode bypasses the content script: the popup already
+				// supplies the text via msg.manualText. Skip this branch when
+				// an intent is set — those still go through the content script.
+				if (mode === 'manual' && !intent) {
+					const manualText = (msg.manualText ?? '').trim();
+					if (!manualText) {
+						sendResponse({
+							ok: false,
+							error: 'Manual text is empty',
+						});
+						return;
+					}
+					const cleanUrl = sanitizeUrl(tab.url);
+					ingest({
+						url: cleanUrl,
+						title: tab.title ?? cleanUrl,
+						text: manualText,
+						visitTs: Date.now(),
+						dwellMs: 0,
+						domain: new URL(cleanUrl).hostname,
+						tags,
+						setTags: true,
+						mode: 'manual',
+					})
+						.then(() => {
+							setBadge(tabId, 'indexed');
+							sendResponse({ ok: true });
+						})
+						.catch((e) => {
+							setBadge(tabId, 'disconnected');
+							sendResponse({ ok: false, error: String(e) });
+						});
+					return;
+				}
+
+				pendingIngest.set(tabId, { mode, tags, intent });
 				const doExtract = () => {
 					chrome.tabs.sendMessage(
 						tabId,
-						{ type: 'force_extract' },
+						{ type: 'force_extract', intent },
 						(res) => {
 							if (chrome.runtime.lastError) {
 								sendResponse({
@@ -567,7 +760,10 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 });
 
 // Clean up state when a tab is closed.
-chrome.tabs.onRemoved.addListener((tabId) => tabBadgeState.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+	tabBadgeState.delete(tabId);
+	pendingIngest.delete(tabId);
+});
 
 chrome.omnibox.onInputChanged.addListener(
 	(

@@ -71,6 +71,146 @@ function extract(): { ok: boolean; error?: string } {
 	return { ok: true };
 }
 
+// CR-0002: extract whatever the user has highlighted.
+function extractSelection(): { ok: boolean; error?: string } {
+	const sel = window.getSelection()?.toString().trim() ?? '';
+	if (!sel) return { ok: false, error: 'Nothing selected' };
+	runtimeSend({
+		type: 'page_viewed',
+		url: location.href,
+		title: document.title,
+		text: sel,
+		dwellMs: 0,
+		meta: extractMeta(),
+	});
+	return { ok: true };
+}
+
+// CR-0002: scrape the YouTube transcript panel. Tries to open the panel if
+// it isn't already; returns an error when CC isn't available for the video.
+async function extractYouTubeTranscript(): Promise<{
+	ok: boolean;
+	error?: string;
+}> {
+	const SEGMENT_SEL = 'ytd-transcript-segment-renderer .segment-text';
+
+	function readSegments(): string[] {
+		return Array.from(document.querySelectorAll(SEGMENT_SEL))
+			.map((el) => (el.textContent ?? '').trim())
+			.filter((s) => s.length > 0);
+	}
+
+	let segments = readSegments();
+	if (segments.length === 0) {
+		// Try clicking the "Show transcript" button — selector varies by locale.
+		const btn = Array.from(
+			document.querySelectorAll<HTMLElement>('button, [role="button"]'),
+		).find((el) => {
+			const label = (
+				el.getAttribute('aria-label') ??
+				el.textContent ??
+				''
+			).toLowerCase();
+			return (
+				label.includes('transcript') ||
+				label.includes('transcrição') ||
+				label.includes('transcricao')
+			);
+		});
+		if (!btn)
+			return {
+				ok: false,
+				error: 'Transcript not available for this video',
+			};
+		btn.click();
+
+		// Wait briefly for the panel to render.
+		const start = Date.now();
+		while (Date.now() - start < 3000) {
+			await new Promise((r) => setTimeout(r, 200));
+			segments = readSegments();
+			if (segments.length > 0) break;
+		}
+		if (segments.length === 0) {
+			return {
+				ok: false,
+				error: 'Transcript not available for this video',
+			};
+		}
+	}
+
+	const text = segments.join(' ');
+	const titleEl = document.querySelector(
+		'h1.ytd-watch-metadata, h1.title yt-formatted-string',
+	);
+	const title = (titleEl?.textContent ?? document.title).trim();
+	runtimeSend({
+		type: 'page_viewed',
+		url: location.href,
+		title,
+		text,
+		dwellMs: 0,
+		meta: extractMeta(),
+	});
+	return { ok: true };
+}
+
+// CR-0003: extract just the payload (title + body) for tag suggestion. Does
+// NOT emit page_viewed — the SW gets the payload back via sendResponse and
+// forwards it to /tags/suggest.
+function extractForSuggest(): {
+	ok: boolean;
+	error?: string;
+	payload?: { url: string; title: string; text: string };
+} {
+	if (hasSensitiveInputs()) return { ok: false, error: 'sensitive page' };
+	const article = new Readability(
+		document.cloneNode(true) as Document,
+	).parse();
+	const text = article?.textContent?.trim() ?? '';
+	if (text.length < 100) {
+		return { ok: false, error: 'Not enough content to suggest tags' };
+	}
+	return {
+		ok: true,
+		payload: {
+			url: location.href,
+			title: article?.title || document.title,
+			text,
+		},
+	};
+}
+
+// CR-0002: read the comment threads currently rendered in the DOM (no scroll).
+function extractYouTubeComments(maxN = 50): { ok: boolean; error?: string } {
+	const nodes = Array.from(
+		document.querySelectorAll('ytd-comment-thread-renderer #content-text'),
+	).slice(0, maxN);
+	const comments = nodes
+		.map((el) => (el.textContent ?? '').trim())
+		.filter((s) => s.length > 0);
+	if (comments.length === 0) {
+		return {
+			ok: false,
+			error: 'No comments visible — scroll to load them',
+		};
+	}
+	const text = comments.join('\n\n---\n\n');
+	const titleEl = document.querySelector(
+		'h1.ytd-watch-metadata, h1.title yt-formatted-string',
+	);
+	const title = (titleEl?.textContent ?? document.title).trim();
+	runtimeSend({
+		type: 'page_viewed',
+		url: location.href,
+		title: `${title} — comments`,
+		text,
+		dwellMs: 0,
+		meta: extractMeta(),
+	});
+	return { ok: true };
+}
+
 // Guard: prevent double initialization when injected programmatically into
 // tabs that were already open (chrome.scripting.executeScript path).
 if (!window.__vbm_cs) {
@@ -196,12 +336,55 @@ if (!window.__vbm_cs) {
 	});
 
 	// Force index: message from service worker bypasses dwell timer.
+	// CR-0002: optional `intent` switches the extraction strategy.
 	chrome.runtime.onMessage.addListener(
-		(msg: { type: string }, _sender, sendResponse) => {
+		(
+			msg: {
+				type: string;
+				intent?:
+					| 'selection'
+					| 'yt_transcript'
+					| 'yt_comments'
+					| 'suggest_tags';
+			},
+			_sender,
+			sendResponse,
+		) => {
 			if (msg.type !== 'force_extract') return;
-			const result = extract();
-			if (result.ok) sent = true;
-			sendResponse(result);
+			switch (msg.intent) {
+				case 'selection': {
+					const r = extractSelection();
+					if (r.ok) sent = true;
+					sendResponse(r);
+					return;
+				}
+				case 'yt_transcript': {
+					extractYouTubeTranscript().then((r) => {
+						if (r.ok) sent = true;
+						sendResponse(r);
+					});
+					return true; // async response
+				}
+				case 'yt_comments': {
+					const r = extractYouTubeComments();
+					if (r.ok) sent = true;
+					sendResponse(r);
+					return;
+				}
+				case 'suggest_tags': {
+					// CR-0003: extracts but does NOT emit page_viewed.
+					// SW receives payload via sendResponse and forwards to /tags/suggest.
+					const r = extractForSuggest();
+					sendResponse(r);
+					return;
+				}
+				default: {
+					const r = extract();
+					if (r.ok) sent = true;
+					sendResponse(r);
+					return;
+				}
+			}
 		},
 	);
 }

@@ -29,9 +29,13 @@ type Session struct {
 }
 
 // DataDir returns the platform-specific directory where vbm stores its data.
+//   - VBM_DATA_DIR (any OS, when set) — explicit override, used for containers.
 //   - Linux/macOS: ~/.local/share/vbm
 //   - Windows:     %APPDATA%\vbm
 func DataDir() (string, error) {
+	if v := os.Getenv("VBM_DATA_DIR"); v != "" {
+		return v, nil
+	}
 	if runtime.GOOS == "windows" {
 		appData := os.Getenv("APPDATA")
 		if appData == "" {

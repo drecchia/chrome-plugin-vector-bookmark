@@ -5,6 +5,9 @@ import {
 	type SearchResponse,
 	type ForgetRequest,
 	type PageStatusResponse,
+	type TagCount,
+	type SuggestTagsRequest,
+	type SuggestTagsResponse,
 } from '../../../proto/types';
 import { getDaemonConfig, getDaemonBase } from './native-bridge';
 
@@ -100,6 +103,36 @@ export async function pageStatus(url: string): Promise<PageStatusResponse> {
 		return (await res.json()) as PageStatusResponse;
 	} catch {
 		return { exists: false, indexed: false };
+	}
+}
+
+export async function suggestTags(
+	req: SuggestTagsRequest,
+): Promise<SuggestTagsResponse> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/tags/suggest`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(req),
+	});
+	if (!res.ok) {
+		const data = (await res.json().catch(() => ({}))) as {
+			error?: string;
+		};
+		throw new Error(data.error ?? `HTTP ${res.status}`);
+	}
+	return (await res.json()) as SuggestTagsResponse;
+}
+
+export async function listTags(): Promise<TagCount[]> {
+	try {
+		const cfg = await getDaemonConfig();
+		const res = await fetch(`${getDaemonBase(cfg)}/tags`);
+		if (!res.ok) return [];
+		const data = (await res.json()) as { tags: TagCount[] };
+		return data.tags ?? [];
+	} catch {
+		return [];
 	}
 }
 

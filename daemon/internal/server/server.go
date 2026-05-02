@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vbm/daemon/internal/embed"
+	"github.com/vbm/daemon/internal/llm"
 	"github.com/vbm/daemon/internal/nm"
 	"github.com/vbm/daemon/internal/queue"
 	"github.com/vbm/daemon/internal/store"
@@ -21,8 +22,62 @@ import (
 
 const version = "0.1.0"
 
+// envSpec declares one env var consulted at startup. defaultDesc is shown
+// next to [MISSING] to tell the user what happens when the var isn't set.
+type envSpec struct {
+	name        string
+	defaultDesc string // empty = no default note
+}
+
+// envSpecs is the single source of truth for env vars consulted by the daemon.
+// Adding a new var = one line here + the actual os.Getenv() call. Banner stays
+// in sync automatically. Order matches grouping (network, embedder, LLM, ops).
+var envSpecs = []envSpec{
+	{"VBM_PORT", "default: 7532"},
+	{"VBM_BIND", "default: 127.0.0.1"},
+	{"VBM_DATA_DIR", "default: $HOME/.local/share/vbm (or %APPDATA%\\vbm on Windows)"},
+	{"VBM_EMBED_URL", "stub embedder (BM25-only)"},
+	{"VBM_EMBED_MODEL", "default: openai/text-embedding-3-small"},
+	{"VBM_EMBED_API_KEY", ""},
+	{"VBM_EMBED_FORMAT", "default: ollama"},
+	{"VBM_LLM_MODEL", "default: gpt-4o-mini"},
+	{"VBM_TTL_DAYS", "retention disabled"},
+	{"VBM_CORS_ORIGIN", ""},
+}
+
+// logEnvBanner prints which env vars are consulted and which are unset. Never
+// prints the actual values — the user can `env | grep VBM` if they need that.
+func logEnvBanner() {
+	const col = 22
+	var b strings.Builder
+	b.WriteString("\n─── env config ───────────────────────────\n")
+	for _, e := range envSpecs {
+		state := "[MISSING]"
+		if os.Getenv(e.name) != "" {
+			state = "[SET]"
+		}
+		pad := col - len(e.name)
+		if pad < 1 {
+			pad = 1
+		}
+		b.WriteString("  ")
+		b.WriteString(e.name)
+		b.WriteString(strings.Repeat(" ", pad))
+		b.WriteString(state)
+		if state == "[MISSING]" && e.defaultDesc != "" {
+			b.WriteString("   (")
+			b.WriteString(e.defaultDesc)
+			b.WriteString(")")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("──────────────────────────────────────────")
+	slog.Info(b.String())
+}
+
 // Run starts the daemon server. Blocks until SIGTERM/SIGINT.
 func Run() error {
+	logEnvBanner()
 	dataDir, err := nm.DataDir()
 	if err != nil {
 		return fmt.Errorf("data dir: %w", err)
@@ -46,6 +101,21 @@ func Run() error {
 		}
 	} else {
 		slog.Warn("VBM_EMBED_URL not set — using stub embedder (BM25-only, no semantic search)")
+	}
+
+	// LLM client (optional): same provider as embedder, chat completions URL
+	// derived from VBM_EMBED_URL. VBM_LLM_MODEL overrides the default model.
+	var llmClient *llm.Client
+	if u := os.Getenv("VBM_EMBED_URL"); u != "" {
+		apiKey := os.Getenv("VBM_EMBED_API_KEY")
+		model := os.Getenv("VBM_LLM_MODEL")
+		c, err := llm.New(u, model, apiKey)
+		if err != nil {
+			slog.Warn("LLM client init failed", "err", err)
+		} else {
+			llmClient = c
+			slog.Info("LLM summarizer ready", "model", model)
+		}
 	}
 
 	s, err := store.New(dataDir, embedder)
@@ -119,9 +189,15 @@ func Run() error {
 		}
 	}
 
-	r := newRouter(s, q, version, extraOrigins)
+	r := newRouter(s, q, version, extraOrigins, llmClient)
 
-	srv := &http.Server{Handler: r}
+	srv := &http.Server{
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

@@ -20,6 +20,8 @@ export interface VisitRequest {
 }
 
 // ---- Ingest (manual full-index with text) ----
+export type IngestMode = 'full_text' | 'llm_summary' | 'manual' | 'meta_only';
+
 export interface IngestRequest {
 	url: string;
 	title: string;
@@ -28,6 +30,43 @@ export interface IngestRequest {
 	visitTs: number;
 	dwellMs: number;
 	domain: string;
+	/** User-assigned tags. */
+	tags?: string[];
+	/**
+	 * If true, `tags` becomes the authoritative final tag list for the page
+	 * (additions + removals applied). If false/absent, tags are merged.
+	 */
+	setTags?: boolean;
+	/** How to post-process `text` before chunking. Default: full_text. */
+	mode?: IngestMode;
+}
+
+// ---- Tags ----
+export interface TagCount {
+	tag: string;
+	count: number;
+}
+
+// ---- Extraction intents (client-side only) ----
+// Marks a non-default extraction strategy run by the content script. The
+// daemon sees `mode: "manual"` for all these — text is fully prepared client-
+// side. CR-0002. `suggest_tags` (CR-0003) extracts but doesn't ingest;
+// payload is forwarded to /tags/suggest via the SW.
+export type ExtractIntent =
+	| 'selection'
+	| 'yt_transcript'
+	| 'yt_comments'
+	| 'suggest_tags';
+
+// ---- Tag suggestion (CR-0003) ----
+export interface SuggestTagsRequest {
+	url: string;
+	title: string;
+	text: string;
+}
+
+export interface SuggestTagsResponse {
+	tags: string[];
 }
 
 // ---- Search ----
@@ -89,6 +128,8 @@ export interface DaemonState {
 export interface PageStatusResponse {
 	exists: boolean;
 	indexed: boolean;
+	/** Tags currently assigned to the page (empty if exists=false). */
+	tags?: string[];
 }
 
 // ---- Content script → SW signals ----

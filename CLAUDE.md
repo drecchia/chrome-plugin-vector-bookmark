@@ -26,6 +26,15 @@ make test         # go test ./...
 make install      # instala + inicia via systemd
 make tidy         # go mod tidy
 
+# Daemon (Docker — CR-0005)
+docker build -t vbmd:dev daemon/
+docker run --rm -p 127.0.0.1:7532:7532 \
+    -e VBM_BIND=0.0.0.0 \
+    -e VBM_DATA_DIR=/data \
+    -e VBM_EMBED_URL=… -e VBM_EMBED_API_KEY=… \
+    -v vbm-data:/data \
+    vbmd:dev
+
 # Extensão
 cd extension
 npm install
@@ -54,15 +63,27 @@ Service Worker (service-worker.ts)
 ```
 
 ### Fluxo de index manual (popup)
-```
-Popup (App.tsx) → popup_force_index
-  → SW injeta content script se necessário
-  → envia force_extract ao content script
-  → Readability extrai texto + extractMeta() extrai meta tags
-  → envia page_viewed {url, title, text, meta}
-  → SW prepend meta fields ao texto → POST /ingest ao daemon
-  → badge verde "page indexed"
-```
+
+O popup tem **um único botão** "Index this site now". Clicá-lo abre um painel inline com:
+- Campo de **tags separadas por vírgula** (pré-preenchido com as tags atuais quando a página já está indexada — operação em **set-mode**: a lista enviada é o estado final).
+- Seletor de **modo de indexação** (4 opções, ver abaixo).
+- (condicional) `<textarea>` quando o modo é `manual`.
+- Botão **Confirm** que dispara `popup_force_index` com `{tags, mode, manualText?}`.
+
+Modos suportados (campo `mode` em `IngestRequest`):
+1. `full_text` (default): SW envia `force_extract` → Readability + meta concatenados → `/ingest` chunka tudo.
+2. `llm_summary`: pipeline igual ao full_text **até** o daemon, que então chama `internal/llm.Summarize()` (provider OpenAI-compat reusando `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` + `VBM_LLM_MODEL`) e indexa apenas o resumo.
+3. `manual`: SW pula o content script e envia direto o texto digitado no `<textarea>`.
+4. `meta_only`: SW envia apenas título + meta tags (description/keywords/og*/author), sem corpo.
+
+Além desses 4 modos do daemon, o popup oferece **3 intents de extração** (CR-0002) que rodam **no client** e mapeiam para `mode: "manual"` no `/ingest`:
+- `selection` — `window.getSelection()` no content script. Erro "Nothing selected" se vazio.
+- `yt_transcript` — abre o painel de transcript do YouTube e raspa `ytd-transcript-segment-renderer .segment-text`. Visível apenas em `youtube.com/watch`. Erro se o vídeo não tem CC.
+- `yt_comments` — lê os top-50 `ytd-comment-thread-renderer #content-text` já carregados no DOM (sem auto-scroll). Visível apenas em `youtube.com/watch`.
+
+Quando `intent` está presente em `popup_force_index`, o SW força `mode: "manual"` no /ingest porque o texto já vem pronto do content script. Em todos os modos, o badge fica verde após o /ingest retornar 202.
+
+**Sugestão de tags via LLM (CR-0003):** o input CSV de tags tem um botão ✨ ao lado. Click → `popup_suggest_tags` → SW envia `force_extract` com `intent: 'suggest_tags'` (que extrai mas **não emite `page_viewed`** — devolve payload via `sendResponse`) → SW chama `POST /tags/suggest` → daemon roda `internal/llm.SuggestTags` recebendo a lista de tags existentes como contexto e devolve até 3 tags → popup faz merge dedup-ado no input. Não toca badge nem ingest.
 
 ### Badge state machine (service-worker.ts)
 Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
@@ -72,13 +93,14 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 ### Daemon (Go)
 - `cmd/vbmd/main.go` — entrypoint, modo `server`
 - `internal/server/routes.go` — todos os handlers HTTP (chi router)
-- `internal/store/sqlite.go` — schema, migrations, Ingest, RecordVisit, Search (BM25+cosine RRF), Forget
+- `internal/store/sqlite.go` — schema, migrations, Ingest, RecordVisit, Search (BM25+cosine RRF), Forget, ListTags/ListPagesByTag/GetPageTags
 - `internal/chunk/chunk.go` — sliding window chunker (512 tokens, overlap 64, mínimo 40)
 - `internal/embed/` — interface Embedder + StubEmbedder (zeros para dev)
+- `internal/llm/` — cliente OpenAI-compat para chat completions: `Summarize()` (resumo de página, CR-0001) e `SuggestTags()` (até 3 tags reusando taxonomia existente, CR-0003); usa o mesmo `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` do embedder, modelo via `VBM_LLM_MODEL`
 - `internal/queue/queue.go` — canal bufferizado cap 256, worker de ingest
 
 ### Extensão (TypeScript)
-- `src/content/extract.ts` — dwell tracking, extractMeta(), force extract via Readability
+- `src/content/extract.ts` — dwell tracking, extractMeta(), force extract via Readability + extractores específicos: `extractSelection`, `extractYouTubeTranscript`, `extractYouTubeComments` (CR-0002)
 - `src/background/service-worker.ts` — orquestrador: badge, mensagens, blacklist
 - `src/background/daemon-client.ts` — todas as chamadas HTTP ao daemon
 - `src/background/native-bridge.ts` — config storage (host, port, dwell threshold)
@@ -93,6 +115,9 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 - Erros sempre propagados com `fmt.Errorf("contexto: %w", err)` — sem `log.Fatal` dentro de packages
 - Todo handler HTTP retorna JSON; erros retornam `{"error":"mensagem"}` com status apropriado
 - Bind exclusivo em `127.0.0.1` — nunca `0.0.0.0`
+- `internal/llm` é opcional: só inicializa se `VBM_EMBED_URL` estiver setado. Sem ele, `mode=llm_summary` retorna 503.
+- Variáveis de ambiente consultadas pelo daemon são listadas no banner do startup (`logEnvBanner` em `server.go`). Ao adicionar uma env nova, atualizar o slice `envSpecs` para mantê-la visível.
+- `VBM_DATA_DIR` (CR-0005) sobrescreve a resolução de `nm.DataDir()`. Usado em containers (distroless não tem `$HOME`). Sem ele, fallback para `~/.local/share/vbm` (Linux/Mac) ou `%APPDATA%\vbm` (Windows).
 
 **TypeScript (extensão):**
 - Tipos da API definidos em `proto/types.ts` — não duplicar em arquivos da extensão
@@ -112,22 +137,26 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 4. **Dedup de página**: `sha1(url)` como `url_hash UNIQUE` — revisitas atualizam a página existente.
 5. **Chunking**: janela 512 tokens, overlap 64, mínimo 40 tokens. Texto < 200 chars descartado no content script.
 6. **Queue com backpressure**: canal cap 256. Se cheio, ingest descartado com log.
-7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 5 default, 20 max.
-8. **Meta indexing**: no index manual (force_extract), meta tags (description, keywords, ogDescription, author) são prefixados ao texto antes do chunking.
+7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 5 default, 20 max. Filtro opcional `?tag=…` restringe candidatos via `page_tags`.
+8. **Modos de ingest**: `full_text` (Readability + meta) | `llm_summary` (resumo via LLM substitui o texto antes do chunking) | `manual` (texto fornecido pelo popup) | `meta_only` (apenas título + meta tags). Default = `full_text`. Em todos os modos, meta + título são prefixados ao corpo, exceto `meta_only` que é apenas o bloco de meta.
+9. **Tags em set-mode**: quando o popup envia ingest com `setTags=true`, a lista de tags vira o estado final daquela página (DELETE + INSERT na mesma tx). `setTags=false`/ausente = merge (INSERT OR IGNORE). Tags são normalizadas para `[a-z0-9 \-_]`, max 64 chars.
 
 ## Entidades principais (SQLite)
 
 ```
-pages       id, url, url_hash (UNIQUE), title, domain, visit_ts (ms), dwell_ms, model_ver, indexed, meta_json, star_rank (não usado), created_at
+pages       id, url, url_hash (UNIQUE), title, domain, visit_ts (ms), dwell_ms, model_ver, indexed, meta_json, created_at
 chunks      id, page_id (FK→pages CASCADE), chunk_idx, text, text_hash, embedding (BLOB f32), model_ver
 chunks_fts  virtual FTS5 sobre chunks.text (porter stemmer)
 queue       id, url, title, text, visit_ts, dwell_ms, domain, status, created_at, updated_at
 blacklist   pattern (PRIMARY KEY), created_at
+page_tags   page_id (FK→pages CASCADE), tag, created_at — PK (page_id, tag); index em tag
 ```
+
+Migrações vivem em `internal/store/sqlite.go` (slice `migrations`, gravadas em `schema_versions`). Esquema atual está em V7. Sempre adicionar nova migração em vez de editar uma existente.
 
 ## O que nunca fazer
 
-- **Nunca** fazer bind do daemon em `0.0.0.0` — somente `127.0.0.1`
+- **Default** do bind do daemon é `127.0.0.1`. Bind em `0.0.0.0` só é aceitável **dentro de container Docker**, e nesse caso o port mapping do host **deve** estar restrito a loopback (ex.: `-p 127.0.0.1:7532:7532`). Nunca expor a porta do container em interface pública sem auth.
 - **Nunca** remover `incognito: "not_allowed"` do manifest
 - **Nunca** usar `log.Fatal` dentro de packages `internal/` — retornar erro para o caller
 - **Nunca** fazer FTS5 rebuild síncrono em operações de ingest — apenas em `Forget`

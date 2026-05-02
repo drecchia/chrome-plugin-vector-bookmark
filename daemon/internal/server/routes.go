@@ -13,17 +13,48 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/gorilla/websocket"
+	"github.com/vbm/daemon/internal/llm"
 	"github.com/vbm/daemon/internal/queue"
 	"github.com/vbm/daemon/internal/store"
 )
 
+// maxRequestBody caps POST/DELETE bodies at 4 MiB to prevent local DoS from
+// unbounded payloads (a 30 MB HTML page produces ~200 chunks of ~500 tokens,
+// which serialized is ≲ 3 MiB — 4 MiB is a comfortable ceiling).
+const maxRequestBody = 4 << 20
+
+// decodeJSONBody wraps req.Body with a size-limited reader, then JSON-decodes
+// into v. Writes a 400/413 response on failure and returns false.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "request body too large") {
+			http.Error(w, `{"error":"request too large"}`, http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 type ingestRequest struct {
-	URL     string `json:"url"`
-	Title   string `json:"title"`
-	Text    string `json:"text"`
-	VisitTs int64  `json:"visitTs"`
-	DwellMs int64  `json:"dwellMs"`
-	Domain  string `json:"domain"`
+	URL     string   `json:"url"`
+	Title   string   `json:"title"`
+	Text    string   `json:"text"`
+	VisitTs int64    `json:"visitTs"`
+	DwellMs int64    `json:"dwellMs"`
+	Domain  string   `json:"domain"`
+	Tags    []string `json:"tags"`
+	// Mode: "full_text" (default) | "llm_summary" | "manual" | "meta_only".
+	// Affects only how Text is post-processed before chunking.
+	Mode string `json:"mode"`
+	// SetTags=true means the Tags slice is the authoritative final list for
+	// this page (additions + removals applied). When false, Tags is merged
+	// with existing tags (legacy accumulate behavior, kept for back-compat).
+	SetTags bool `json:"setTags"`
 }
 
 type forgetRequest struct {
@@ -134,6 +165,7 @@ h1{font-size:15px;font-weight:600}
   </header>
   <div class="tabs">
     <button class="tab active" data-panel="search-panel">Search</button>
+    <button class="tab" data-panel="tags-panel">Tags</button>
     <button class="tab" data-panel="hotwords-panel">Hot Words</button>
     <button class="tab" data-panel="hist-panel">Timeline</button>
     <button class="tab" data-panel="blacklist-panel">Exclusions</button>
@@ -142,9 +174,17 @@ h1{font-size:15px;font-weight:600}
   <div id="search-panel" class="panel active">
     <div class="search-row">
       <input id="q" type="search" placeholder="Search your reading history..." autofocus>
+      <select id="tag-filter" style="padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;outline:none;max-width:160px">
+        <option value="">all tags</option>
+      </select>
       <button id="search-btn">Search</button>
     </div>
     <div id="results"></div>
+  </div>
+
+  <div id="tags-panel" class="panel">
+    <div id="tags-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px"></div>
+    <div id="tags-pages"></div>
   </div>
 
   <div id="hotwords-panel" class="panel">
@@ -193,10 +233,13 @@ var q=document.getElementById('q'),btn=document.getElementById('search-btn'),res
 fetch('/status').then(function(r){return r.json()}).then(function(d){stat.textContent=d.indexed+' pages indexed'}).catch(function(){})
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function fmt(ts){var d=new Date(ts),diff=Date.now()-ts;if(diff<86400000)return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});if(diff<604800000)return d.toLocaleDateString([],{weekday:'short'});return d.toLocaleDateString([],{month:'short',day:'numeric'})}
+var tagFilter=document.getElementById('tag-filter')
 function search(){
   var v=q.value.trim();if(!v)return
   btn.disabled=true;btn.textContent='...'
-  fetch('/search?q='+encodeURIComponent(v)+'&limit=10').then(function(r){return r.json()}).then(function(data){
+  var url='/search?q='+encodeURIComponent(v)+'&limit=10'
+  var t=tagFilter&&tagFilter.value;if(t)url+='&tag='+encodeURIComponent(t)
+  fetch(url).then(function(r){return r.json()}).then(function(data){
     var list=data.results||[]
     if(!list.length){res.innerHTML='<div class="empty">No results</div>';return}
     res.innerHTML='<div class="count">'+list.length+' result'+(list.length>1?'s':'')+'</div>'+list.map(function(r){
@@ -476,6 +519,57 @@ blInput.addEventListener('keydown',function(e){if(e.key==='Enter')document.getEl
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
   if(t.dataset.panel==='blacklist-panel')blLoad()
 })})
+
+// ── tags ──────────────────────────────────────────────────────────────────────
+var tagsList=document.getElementById('tags-list'),tagsPages=document.getElementById('tags-pages'),activeTag=null
+function tagsLoadDropdown(){
+  fetch('/tags').then(function(r){return r.json()}).then(function(d){
+    var tags=d.tags||[]
+    tagFilter.innerHTML='<option value="">all tags</option>'+tags.map(function(t){
+      return '<option value="'+esc(t.tag)+'">'+esc(t.tag)+' ('+t.count+')</option>'
+    }).join('')
+  }).catch(function(){})
+}
+function tagsRender(){
+  fetch('/tags').then(function(r){return r.json()}).then(function(d){
+    var tags=d.tags||[]
+    if(!tags.length){
+      tagsList.innerHTML='<div class="empty" style="padding:20px 0">No tags yet — use "Index with tag" in the popup</div>'
+      tagsPages.innerHTML=''
+      return
+    }
+    tagsList.innerHTML=tags.map(function(t){
+      var on=t.tag===activeTag
+      return '<button class="tag-pill" data-tag="'+esc(t.tag)+'" style="font-size:12px;padding:5px 10px;border-radius:14px;cursor:pointer;border:1px solid '+(on?'#111':'#e5e7eb')+';background:'+(on?'#111':'#fff')+';color:'+(on?'#fff':'#374151')+'">'+esc(t.tag)+' <span style="opacity:.6">'+t.count+'</span></button>'
+    }).join('')
+    if(activeTag)tagsLoadPages(activeTag)
+    else tagsPages.innerHTML='<div class="empty" style="padding:20px 0">Select a tag to list pages</div>'
+  }).catch(function(){tagsList.innerHTML='<div class="empty">Failed to load tags</div>'})
+}
+function tagsLoadPages(t){
+  tagsPages.innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
+  fetch('/pages?tag='+encodeURIComponent(t)+'&limit=200').then(function(r){return r.json()}).then(function(d){
+    var pages=d.pages||[]
+    if(!pages.length){tagsPages.innerHTML='<div class="empty">No pages with this tag</div>';return}
+    tagsPages.innerHTML='<div class="count">'+pages.length+' page'+(pages.length>1?'s':'')+'</div>'+pages.map(function(p){
+      var others=(p.tags||[]).filter(function(x){return x!==t}).map(function(x){return '<span class="hist-kw">'+esc(x)+'</span>'}).join('')
+      return '<div class="result">'+
+        '<div class="result-meta"><span class="domain">'+esc(p.domain)+'</span><span class="date">'+fmt(p.visitTs)+'</span></div>'+
+        '<a class="result-title" href="'+esc(p.url)+'" target="_blank">'+esc(p.title||p.url)+'</a>'+
+        (others?'<div class="hist-kws" style="margin-top:4px">'+others+'</div>':'')+
+      '</div>'
+    }).join('')
+  }).catch(function(){tagsPages.innerHTML='<div class="empty">Failed to load</div>'})
+}
+tagsList.addEventListener('click',function(e){
+  var b=e.target.closest('.tag-pill');if(!b)return
+  activeTag=(activeTag===b.dataset.tag)?null:b.dataset.tag
+  tagsRender()
+})
+document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
+  if(t.dataset.panel==='tags-panel')tagsRender()
+})})
+tagsLoadDropdown()
 </script>
 </body>
 </html>`
@@ -577,7 +671,8 @@ type reindexState struct {
 
 // newRouter builds the HTTP router. extraOrigins are additional CORS-allowed origins
 // beyond chrome-extension:// (e.g. a local dashboard, configured via VBM_CORS_ORIGIN).
-func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string) http.Handler {
+// llmClient may be nil; when nil, mode=llm_summary returns 503.
+func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string, llmClient *llm.Client) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -612,8 +707,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Domain  string          `json:"domain"`
 				Meta    json.RawMessage `json:"meta"`
 			}
-			if err := json.NewDecoder(req.Body).Decode(&vr); err != nil {
-				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			if !decodeJSONBody(w, req, &vr) {
 				return
 			}
 			metaJSON := ""
@@ -671,19 +765,45 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 		})
 
 		// POST /ingest — manual full-index with text extraction + embedding.
+		// Mode dispatch: full_text (default) | llm_summary | manual | meta_only.
+		// llm_summary blocks the request while the LLM is called so the user
+		// sees errors immediately. Other modes just enqueue.
 		r.Post("/ingest", func(w http.ResponseWriter, req *http.Request) {
 			var ir ingestRequest
-			if err := json.NewDecoder(req.Body).Decode(&ir); err != nil {
-				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			if !decodeJSONBody(w, req, &ir) {
 				return
 			}
+			text := ir.Text
+			switch ir.Mode {
+			case "", "full_text", "manual", "meta_only":
+				// Use provided text as-is. Popup is responsible for shaping
+				// "manual" (typed) and "meta_only" (title + meta) before send.
+			case "llm_summary":
+				if llmClient == nil {
+					http.Error(w, `{"error":"LLM not configured (set VBM_EMBED_API_KEY and VBM_EMBED_URL)"}`, http.StatusServiceUnavailable)
+					return
+				}
+				summary, err := llmClient.Summarize(req.Context(), text)
+				if err != nil {
+					slog.Warn("llm summarize failed", "url", ir.URL, "err", err)
+					http.Error(w, `{"error":"LLM call failed"}`, http.StatusBadGateway)
+					return
+				}
+				text = summary
+			default:
+				http.Error(w, `{"error":"unknown mode"}`, http.StatusBadRequest)
+				return
+			}
+
 			ireq := store.IngestRequest{
 				URL:     ir.URL,
 				Title:   ir.Title,
-				Text:    ir.Text,
+				Text:    text,
 				VisitTs: ir.VisitTs,
 				DwellMs: ir.DwellMs,
 				Domain:  ir.Domain,
+				Tags:    ir.Tags,
+				SetTags: ir.SetTags,
 			}
 			q.Enqueue(ireq)
 			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
@@ -712,7 +832,8 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			if limit > 20 {
 				limit = 20
 			}
-			results, err := s.Search(query, limit)
+			tag := req.URL.Query().Get("tag")
+			results, err := s.Search(query, limit, tag)
 			if err != nil {
 				http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
 				return
@@ -747,8 +868,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 
 		r.Delete("/forget", func(w http.ResponseWriter, req *http.Request) {
 			var fr forgetRequest
-			if err := json.NewDecoder(req.Body).Decode(&fr); err != nil {
-				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			if !decodeJSONBody(w, req, &fr) {
 				return
 			}
 			if err := s.Forget(store.ForgetRequest{Type: fr.Type, Value: fr.Value}); err != nil {
@@ -795,10 +915,18 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				http.Error(w, `{"error":"lookup failed"}`, http.StatusInternalServerError)
 				return
 			}
+			tags := []string{}
+			if exists {
+				tags, _ = s.GetPageTags(rawURL)
+				if tags == nil {
+					tags = []string{}
+				}
+			}
 			json.NewEncoder(w).Encode(struct {
-				Exists  bool `json:"exists"`
-				Indexed bool `json:"indexed"`
-			}{Exists: exists, Indexed: indexed})
+				Exists  bool     `json:"exists"`
+				Indexed bool     `json:"indexed"`
+				Tags    []string `json:"tags"`
+			}{Exists: exists, Indexed: indexed, Tags: tags})
 		})
 
 		// CR-010: user-managed domain blacklist endpoints.
@@ -821,7 +949,10 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			var body struct {
 				Pattern string `json:"pattern"`
 			}
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Pattern == "" {
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			if body.Pattern == "" {
 				http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
 				return
 			}
@@ -837,7 +968,10 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			var body struct {
 				Pattern string `json:"pattern"`
 			}
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Pattern == "" {
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			if body.Pattern == "" {
 				http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
 				return
 			}
@@ -1125,6 +1259,103 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(statusResp{Running: running, Done: done, Total: total})
+		})
+
+		// POST /tags/suggest — runs the LLM over the supplied page context and
+		// returns up to 3 tags. Reuses the same provider as the embedder/llm
+		// summary path. Returns 503 when no LLM is configured.
+		r.Post("/tags/suggest", func(w http.ResponseWriter, req *http.Request) {
+			var body struct {
+				URL   string `json:"url"`
+				Title string `json:"title"`
+				Text  string `json:"text"`
+			}
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			if llmClient == nil {
+				http.Error(w, `{"error":"LLM not configured"}`, http.StatusServiceUnavailable)
+				return
+			}
+			if len(strings.TrimSpace(body.Text)) < 100 {
+				http.Error(w, `{"error":"not enough content"}`, http.StatusBadRequest)
+				return
+			}
+
+			existing, _ := s.ListTags()
+			existingNames := make([]string, 0, len(existing))
+			for _, t := range existing {
+				existingNames = append(existingNames, t.Tag)
+			}
+
+			raw, err := llmClient.SuggestTags(req.Context(), body.Title, body.Text, existingNames)
+			if err != nil {
+				slog.Warn("llm suggest tags failed", "url", body.URL, "err", err)
+				http.Error(w, `{"error":"LLM call failed"}`, http.StatusBadGateway)
+				return
+			}
+
+			// Normalize via the same rules used at ingest, drop empties + dedup
+			// preserving order. Cap at 3.
+			seen := make(map[string]struct{}, len(raw))
+			out := make([]string, 0, 3)
+			for _, t := range raw {
+				nt := store.NormalizeTag(t)
+				if nt == "" {
+					continue
+				}
+				if _, ok := seen[nt]; ok {
+					continue
+				}
+				seen[nt] = struct{}{}
+				out = append(out, nt)
+				if len(out) >= 3 {
+					break
+				}
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Tags []string `json:"tags"`
+			}{Tags: out})
+		})
+
+		// /tags — list all tags with page counts (feeds popup autocomplete + UI tab).
+		r.Get("/tags", func(w http.ResponseWriter, req *http.Request) {
+			tags, err := s.ListTags()
+			if err != nil {
+				http.Error(w, `{"error":"list tags failed"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Tags []store.TagCount `json:"tags"`
+			}{Tags: tags})
+		})
+
+		// /pages?tag=xyz&limit=N — list pages carrying the given tag, newest first.
+		r.Get("/pages", func(w http.ResponseWriter, req *http.Request) {
+			tag := req.URL.Query().Get("tag")
+			if tag == "" {
+				http.Error(w, `{"error":"tag required"}`, http.StatusBadRequest)
+				return
+			}
+			limit := 100
+			if ls := req.URL.Query().Get("limit"); ls != "" {
+				if n, err := strconv.Atoi(ls); err == nil && n > 0 {
+					limit = n
+				}
+			}
+			pages, err := s.ListPagesByTag(tag, limit)
+			if err != nil {
+				http.Error(w, `{"error":"list pages failed"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Pages []store.TaggedPage `json:"pages"`
+				Total int                `json:"total"`
+			}{Pages: pages, Total: len(pages)})
 		})
 
 		r.Get("/ui", func(w http.ResponseWriter, req *http.Request) {

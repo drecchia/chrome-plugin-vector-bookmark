@@ -2,57 +2,129 @@ package queue
 
 import (
 	"log/slog"
+	"runtime"
 	"sync"
 
+	"github.com/vbm/daemon/internal/chunk"
 	"github.com/vbm/daemon/internal/store"
 )
 
-// Queue is a buffered in-memory work queue backed by a store.
+// Queue is a two-stage pipeline:
+//
+//	Enqueue → inbound (cap bufSize) → N embedder workers (chunk+embed) →
+//	writeCh (cap 64) → 1 DB-writer goroutine → SQLite
+//
+// Splitting embed (CPU-bound) from write (SQLite single-writer) lets
+// embedding run in parallel without producing lock contention on the DB.
 type Queue struct {
-	ch    chan store.IngestRequest
-	store *store.Store
-	wg    sync.WaitGroup
+	inbound chan store.IngestRequest
+	writeCh chan store.PreparedIngest
+	store   *store.Store
+
+	embedWg sync.WaitGroup // tracks embed workers; when all exit, writeCh closes
+	allWg   sync.WaitGroup // tracks every goroutine (embed + writer + coordinator)
 }
 
-// New creates a Queue with a given buffer size and starts the background worker.
+// workerCount caps embed workers at 4 — more threads compete for CPU with the
+// HTTP server and the DB-writer without adding throughput for a local daemon.
+func workerCount() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	if n > 4 {
+		n = 4
+	}
+	return n
+}
+
+// New creates a Queue with the given inbound buffer size and starts workers.
 func New(s *store.Store, bufSize int) *Queue {
-	q := &Queue{ch: make(chan store.IngestRequest, bufSize), store: s}
-	q.wg.Add(1)
-	go q.worker()
+	n := workerCount()
+	q := &Queue{
+		inbound: make(chan store.IngestRequest, bufSize),
+		writeCh: make(chan store.PreparedIngest, 64),
+		store:   s,
+	}
+	for i := 0; i < n; i++ {
+		q.embedWg.Add(1)
+		q.allWg.Add(1)
+		go q.embedWorker()
+	}
+	q.allWg.Add(1)
+	go q.writer()
+	// Coordinator: when all embed workers have drained and exited, close writeCh
+	// so the writer knows no more prepared ingests will arrive.
+	q.allWg.Add(1)
+	go func() {
+		defer q.allWg.Done()
+		q.embedWg.Wait()
+		close(q.writeCh)
+	}()
+	slog.Info("ingest pipeline started", "embed_workers", n, "inbound_cap", bufSize, "write_cap", 64)
 	return q
 }
 
-// Enqueue adds a request to the queue. Drops silently if buffer is full.
+// Enqueue adds a request to the inbound buffer. Drops silently if full.
 func (q *Queue) Enqueue(req store.IngestRequest) {
 	select {
-	case q.ch <- req:
+	case q.inbound <- req:
 	default:
 		slog.Warn("dropped ingest, buffer full", "url", req.URL)
 	}
 }
 
-// Close signals the worker to stop after draining remaining items.
-// Must be called exactly once. After Close, Enqueue must not be called.
-func (q *Queue) Close() {
-	close(q.ch)
-}
+// Close signals the pipeline to drain and stop. Must be called exactly once.
+func (q *Queue) Close() { close(q.inbound) }
 
-// Wait blocks until the worker goroutine has finished processing all items.
-func (q *Queue) Wait() {
-	q.wg.Wait()
-}
+// Wait blocks until every goroutine (workers + writer + coordinator) has exited.
+func (q *Queue) Wait() { q.allWg.Wait() }
 
-func (q *Queue) worker() {
-	defer q.wg.Done()
-	for req := range q.ch {
-		if err := q.store.Ingest(req); err != nil {
-			// Leave the queue row as 'pending' — it will be retried on next startup.
-			slog.Error("ingest error", "url", req.URL, "err", err)
+func (q *Queue) embedWorker() {
+	defer q.embedWg.Done()
+	defer q.allWg.Done()
+	e := q.store.Embedder()
+	for req := range q.inbound {
+		chunks := chunk.SplitIntoChunks(req.Text)
+		if len(chunks) == 0 {
+			if err := q.store.RemoveQueueItem(req.URL); err != nil {
+				slog.Warn("remove queue item (too-short) error", "url", req.URL, "err", err)
+			}
 			continue
 		}
-		// P2-02: remove from persistent queue only after successful ingest.
-		if err := q.store.RemoveQueueItem(req.URL); err != nil {
-			slog.Warn("remove queue item error", "url", req.URL, "err", err)
+		prepared := make([]store.PreparedChunk, 0, len(chunks))
+		failed := false
+		for _, c := range chunks {
+			vec, err := e.Embed(c.Text)
+			if err != nil {
+				slog.Error("embed chunk error", "url", req.URL, "chunk", c.Index, "err", err)
+				failed = true
+				break
+			}
+			prepared = append(prepared, store.PreparedChunk{
+				Index: c.Index,
+				Text:  c.Text,
+				Hash:  c.Hash,
+				Vec:   vec,
+			})
+		}
+		if failed {
+			// Leave queue row as 'pending' — retried on restart.
+			continue
+		}
+		q.writeCh <- store.PreparedIngest{Req: req, Chunks: prepared}
+	}
+}
+
+func (q *Queue) writer() {
+	defer q.allWg.Done()
+	for p := range q.writeCh {
+		if err := q.store.IngestPrepared(p); err != nil {
+			slog.Error("db write error", "url", p.Req.URL, "err", err)
+			continue
+		}
+		if err := q.store.RemoveQueueItem(p.Req.URL); err != nil {
+			slog.Warn("remove queue item error", "url", p.Req.URL, "err", err)
 		}
 	}
 }

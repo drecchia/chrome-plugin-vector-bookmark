@@ -1,5 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { StatusResponse, ForgetRequest } from '../../../proto/types';
+import type {
+	StatusResponse,
+	ForgetRequest,
+	TagCount,
+	IngestMode,
+	ExtractIntent,
+} from '../../../proto/types';
+
+// Popup-only union: the radio set offers IngestMode (4 base modes) plus
+// ExtractIntent (3 client-side strategies). Intents send `intent` to the SW
+// instead of `mode` — daemon never sees them.
+type PopupMode = IngestMode | ExtractIntent;
+const INTENT_SET = new Set<PopupMode>([
+	'selection',
+	'yt_transcript',
+	'yt_comments',
+]);
 import {
 	DEFAULT_HOST,
 	DEFAULT_PORT,
@@ -9,10 +25,18 @@ import {
 } from '../background/native-bridge';
 import { reindex, getReindexStatus } from '../background/daemon-client';
 
+function formatAgo(ms: number): string {
+	if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+	return `${Math.round(ms / 3_600_000)}h`;
+}
+
 export default function App() {
 	const [status, setStatus] = useState<StatusResponse | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(true);
+	const [connected, setConnected] = useState<boolean>(true);
+	const [lastSeenTs, setLastSeenTs] = useState<number | null>(null);
 	const [forgetValue, setForgetValue] = useState('');
 	const [forgetType, setForgetType] = useState<'url' | 'domain'>('url');
 	const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
@@ -29,6 +53,12 @@ export default function App() {
 		total: number;
 	} | null>(null);
 	const reindexPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	const [knownTags, setKnownTags] = useState<TagCount[]>([]);
+	const [panelOpen, setPanelOpen] = useState(false);
+	const [tagsCSV, setTagsCSV] = useState('');
+	const [mode, setMode] = useState<PopupMode>('full_text');
+	const [manualText, setManualText] = useState('');
+	const [suggestLoading, setSuggestLoading] = useState(false);
 
 	useEffect(() => {
 		chrome.storage.local.get(
@@ -47,8 +77,14 @@ export default function App() {
 			setLoading(false);
 			if (chrome.runtime.lastError) {
 				setError(chrome.runtime.lastError.message ?? 'Unknown error');
+				setConnected(false);
 				return;
 			}
+			// res always carries connected/lastSeenTs (both success & error paths).
+			if (typeof res?.connected === 'boolean')
+				setConnected(res.connected);
+			if (typeof res?.lastSeenTs === 'number' || res?.lastSeenTs === null)
+				setLastSeenTs(res.lastSeenTs ?? null);
 			if (res?.error) setError(res.error);
 			else setStatus(res as StatusResponse);
 		});
@@ -66,9 +102,19 @@ export default function App() {
 						if (chrome.runtime.lastError) return;
 						setPageExists(res?.exists ?? false);
 						setPageIndexed(res?.indexed ?? false);
+						if (Array.isArray(res?.tags)) {
+							setTagsCSV((res.tags as string[]).join(', '));
+						}
 					},
 				);
 			}
+		});
+	}, []);
+
+	useEffect(() => {
+		chrome.runtime.sendMessage({ type: 'popup_list_tags' }, (res) => {
+			if (chrome.runtime.lastError) return;
+			if (Array.isArray(res?.tags)) setKnownTags(res.tags as TagCount[]);
 		});
 	}, []);
 
@@ -91,11 +137,95 @@ export default function App() {
 		);
 	}
 
-	function handleForceIndex() {
-		chrome.runtime.sendMessage({ type: 'popup_force_index' }, (res) => {
+	function parseTagsCSV(csv: string): string[] {
+		return csv
+			.split(',')
+			.map((t) => t.trim())
+			.filter((t) => t.length > 0);
+	}
+
+	function handleToggleIndexPanel() {
+		setPanelOpen((v) => !v);
+	}
+
+	// CR-0003: merge generated tags into the existing CSV string, preserving
+	// order and dropping case-insensitive duplicates.
+	function mergeTagsCSV(existing: string, generated: string[]): string {
+		const seen = new Set<string>();
+		const out: string[] = [];
+		for (const raw of existing.split(',')) {
+			const t = raw.trim();
+			if (!t) continue;
+			const k = t.toLowerCase();
+			if (seen.has(k)) continue;
+			seen.add(k);
+			out.push(t);
+		}
+		for (const t of generated) {
+			const k = t.trim().toLowerCase();
+			if (!k || seen.has(k)) continue;
+			seen.add(k);
+			out.push(t.trim());
+		}
+		return out.join(', ');
+	}
+
+	function handleSuggestTags() {
+		setSuggestLoading(true);
+		chrome.runtime.sendMessage({ type: 'popup_suggest_tags' }, (res) => {
+			setSuggestLoading(false);
+			if (chrome.runtime.lastError) {
+				flash('Could not reach background', false);
+				return;
+			}
+			if (res?.ok && Array.isArray(res.tags)) {
+				const next = mergeTagsCSV(tagsCSV, res.tags as string[]);
+				setTagsCSV(next);
+				flash(`Suggested ${res.tags.length} tag(s)`);
+			} else {
+				flash(res?.error ?? 'Could not suggest tags', false);
+			}
+		});
+	}
+
+	function handleConfirmIndex() {
+		const tags = parseTagsCSV(tagsCSV);
+		const payload: {
+			type: string;
+			tags: string[];
+			mode?: IngestMode;
+			manualText?: string;
+			intent?: ExtractIntent;
+		} = { type: 'popup_force_index', tags };
+		if (INTENT_SET.has(mode)) {
+			payload.intent = mode as ExtractIntent;
+		} else {
+			payload.mode = mode as IngestMode;
+			if (mode === 'manual') {
+				const t = manualText.trim();
+				if (!t) {
+					flash('Type or paste the text to index', false);
+					return;
+				}
+				payload.manualText = t;
+			}
+		}
+		chrome.runtime.sendMessage(payload, (res) => {
 			if (chrome.runtime.lastError) return;
-			if (res?.ok) flash('Page queued for indexing');
-			else flash(res?.error ?? 'Could not index page', false);
+			if (res?.ok) {
+				flash('Indexed');
+				setPanelOpen(false);
+				setManualText('');
+				setPageIndexed(true);
+				setPageExists(true);
+				chrome.runtime.sendMessage({ type: 'popup_list_tags' }, (r) => {
+					if (chrome.runtime.lastError) return;
+					if (Array.isArray(r?.tags))
+						setKnownTags(r.tags as TagCount[]);
+				});
+			} else {
+				flash(res?.error ?? 'Could not index page', false);
+			}
 		});
 	}
 
@@ -468,13 +598,32 @@ export default function App() {
 
 			<div style={s.divider} />
 
+			{/* Daemon offline banner — shown when SW has no recent healthy contact. */}
+			{!loading && !connected && (
+				<div
+					style={{
+						fontSize: '12px',
+						color: '#991b1b',
+						background: '#fef2f2',
+						border: '1px solid #fecaca',
+						borderRadius: '4px',
+						padding: '6px 8px',
+					}}
+				>
+					<strong>Daemon offline.</strong> Start <code>vbmd</code>
+					{lastSeenTs
+						? ` — last seen ${formatAgo(Date.now() - lastSeenTs)} ago.`
+						: '.'}
+				</div>
+			)}
+
 			{/* Status */}
 			{loading && (
 				<div style={{ fontSize: '12px', color: '#9ca3af' }}>
 					Connecting...
 				</div>
 			)}
-			{error && <div style={s.errorBox}>{error}</div>}
+			{error && connected && <div style={s.errorBox}>{error}</div>}
 			{status && (
 				<div style={s.stat}>
 					<span>
@@ -488,7 +637,7 @@ export default function App() {
 							<strong>{status.pending}</strong> pending
 						</span>
 					)}
-					{status.daemonPort && (
+					{status.daemonPort && connected && (
 						<a
 							href={`http://${host}:${status.daemonPort}/ui`}
 							target="_blank"
@@ -523,10 +672,231 @@ export default function App() {
 			{/* Flash message */}
 			{msg && <div style={s.flashBox(msg.ok)}>{msg.text}</div>}
 
-			{/* Index this page */}
-			<button style={s.indexBtn} onClick={handleForceIndex}>
-				Index this page now
+			{/* Index this site — single entry point; click expands the options panel */}
+			<button style={s.indexBtn} onClick={handleToggleIndexPanel}>
+				{panelOpen ? 'Cancel' : 'Index this site now'}
 			</button>
+
+			{panelOpen && (
+				<div
+					style={{
+						display: 'flex',
+						flexDirection: 'column',
+						gap: '10px',
+						padding: '10px',
+						border: '1px solid #e5e7eb',
+						borderRadius: '6px',
+						background: '#fafafa',
+					}}
+				>
+					<div>
+						<div style={s.label}>
+							Tags{' '}
+							<span style={{ fontWeight: 400, color: '#9ca3af' }}>
+								(comma-separated)
+							</span>
+						</div>
+						<div
+							style={{
+								display: 'flex',
+								gap: '5px',
+								alignItems: 'stretch',
+							}}
+						>
+							<input
+								style={{ ...s.input, flex: 1 }}
+								type="text"
+								list="vbm-known-tags"
+								placeholder="read-later, ai, work"
+								value={tagsCSV}
+								onChange={(e) => setTagsCSV(e.target.value)}
+							/>
+							<button
+								type="button"
+								title="Suggest up to 3 tags via LLM"
+								onClick={handleSuggestTags}
+								disabled={suggestLoading}
+								style={{
+									flexShrink: 0,
+									width: '32px',
+									padding: '0',
+									border: '1px solid #d1d5db',
+									borderRadius: '4px',
+									background: suggestLoading
+										? '#f3f4f6'
+										: '#fff',
+									cursor: suggestLoading
+										? 'default'
+										: 'pointer',
+									fontSize: '14px',
+									lineHeight: 1,
+								}}
+							>
+								{suggestLoading ? '…' : '✨'}
+							</button>
+						</div>
+						<datalist id="vbm-known-tags">
+							{knownTags.map((t) => (
+								<option key={t.tag} value={t.tag}>
+									{t.count}
+								</option>
+							))}
+						</datalist>
+					</div>
+
+					<div>
+						<div style={s.label}>How to index</div>
+						<div
+							style={{
+								display: 'flex',
+								flexDirection: 'column',
+								gap: '4px',
+								fontSize: '12px',
+								color: '#374151',
+							}}
+						>
+							{(() => {
+								const baseRadios: Array<[PopupMode, string]> = [
+									[
+										'full_text',
+										'Index every chunk (full text)',
+									],
+									[
+										'llm_summary',
+										'Summarize via LLM, then index',
+									],
+									['selection', 'Only the selected text'],
+									['manual', 'Type the text manually'],
+									['meta_only', 'Only meta tags + title'],
+								];
+								const isYTWatch = (() => {
+									if (!currentTabUrl) return false;
+									try {
+										const u = new URL(currentTabUrl);
+										return (
+											u.hostname.endsWith(
+												'youtube.com',
+											) && u.pathname === '/watch'
+										);
+									} catch {
+										return false;
+									}
+								})();
+								const ytRadios: Array<[PopupMode, string]> = [
+									[
+										'yt_transcript',
+										'YouTube — transcribe (CC)',
+									],
+									[
+										'yt_comments',
+										'YouTube — comments (visible)',
+									],
+								];
+								return (
+									<>
+										{baseRadios.map(([val, label]) => (
+											<label
+												key={val}
+												style={{
+													display: 'flex',
+													alignItems: 'center',
+													gap: '6px',
+													cursor: 'pointer',
+												}}
+											>
+												<input
+													type="radio"
+													name="vbm-mode"
+													value={val}
+													checked={mode === val}
+													onChange={() =>
+														setMode(val)
+													}
+												/>
+												<span>{label}</span>
+											</label>
+										))}
+										{isYTWatch && (
+											<>
+												<div
+													style={{
+														fontSize: '10px',
+														color: '#9ca3af',
+														marginTop: '4px',
+														textTransform:
+															'uppercase',
+														letterSpacing: '.04em',
+													}}
+												>
+													— YouTube
+												</div>
+												{ytRadios.map(
+													([val, label]) => (
+														<label
+															key={val}
+															style={{
+																display: 'flex',
+																alignItems:
+																	'center',
+																gap: '6px',
+																cursor: 'pointer',
+															}}
+														>
+															<input
+																type="radio"
+																name="vbm-mode"
+																value={val}
+																checked={
+																	mode === val
+																}
+																onChange={() =>
+																	setMode(val)
+																}
+															/>
+															<span>{label}</span>
+														</label>
+													),
+												)}
+											</>
+										)}
+									</>
+								);
+							})()}
+						</div>
+					</div>
+
+					{mode === 'manual' && (
+						<div>
+							<div style={s.label}>Manual text</div>
+							<textarea
+								style={{
+									...s.input,
+									width: '100%',
+									minHeight: '90px',
+									fontFamily: 'inherit',
+									resize: 'vertical',
+								}}
+								placeholder="Paste or type the content to index…"
+								value={manualText}
+								onChange={(e) => setManualText(e.target.value)}
+							/>
+						</div>
+					)}
+
+					<button
+						style={{
+							...s.indexBtn,
+							background: '#111',
+							color: '#fff',
+							border: 'none',
+							fontWeight: 500,
+						}}
+						onClick={handleConfirmIndex}
+					>
+						Confirm
+					</button>
+				</div>
+			)}
 
 			{/* Don't track this site — subordinate, destructive-ish */}
 			<button
