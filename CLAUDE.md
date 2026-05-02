@@ -45,9 +45,26 @@ npm run typecheck # tsc --noEmit sem gerar arquivos
 # Verificar daemon rodando
 curl http://127.0.0.1:7532/healthz
 curl http://127.0.0.1:7532/status
+curl http://127.0.0.1:7532/metrics
+
+# Convenience scripts (raiz do repo — entrypoints reais do dia-a-dia)
+./build-linux.sh    # build daemon (linux) + extension
+./build-windows.sh  # cross-compile vbmd.exe a partir do WSL
+./dev.sh            # build + start daemon, imprime caminho da extensão
+./dev.ps1           # equivalente PowerShell para Windows
 ```
 
 Carregar extensão: `chrome://extensions/` → Developer mode → Load unpacked → `extension/dist/`
+
+## Configuração
+
+Env file carregado no startup do daemon:
+- Linux:   `~/.config/vbm/env`
+- Windows: `%APPDATA%\vbm\env`
+
+Vars consultadas: `VBM_PORT`, `VBM_BIND`, `VBM_EMBED_URL`, `VBM_EMBED_API_KEY`, `VBM_LLM_MODEL`, `VBM_TTL_DAYS`, `VBM_DATA_DIR`, `VBM_LOG_LEVEL`, `VBM_LLM_PROMPT_SUMMARIZE_FILE`, `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE`. O banner de startup (`logEnvBanner`) imprime todas — manter o slice `envSpecs` em sync ao adicionar uma nova env.
+
+Documentação adicional em `docs/`: `GUIA.md` (uso), `OPERATIONS.md` (operação), `bootstrap/` e `maturity/` (artefatos de processo).
 
 ## Arquitetura
 
@@ -163,3 +180,9 @@ Migrações vivem em `internal/store/sqlite.go` (slice `migrations`, gravadas em
 - **Nunca** persistir embeddings sem o campo `model_ver`
 - **Nunca** duplicar tipos do `proto/types.ts` na extensão
 - **Nunca** commitar `daemon/bin/`, `extension/dist/`, `extension/node_modules/`, `*.db`
+
+## Workflow de mudanças (CR + DECISIONS)
+
+- Toda mudança não-trivial vira um arquivo `changes/CR-NNNN.md` (atual: 0001-0006). CRs descrevem o **quê** e o **como** da entrega.
+- Decisões arquiteturais com **o quê / por quê / quando** vão em `DECISIONS.md` (D-001, D-002, ...). Antes de reverter ou contradizer um padrão, ler a entrada D-NNN correspondente — ela explica por que aquilo está como está.
+- Use o skill `change-request` (`/cr` ou `/change`) para criar/editar CRs neste projeto — ele segue o template existente.
