@@ -41,6 +41,8 @@ var envSpecs = []envSpec{
 	{"VBM_EMBED_API_KEY", ""},
 	{"VBM_EMBED_FORMAT", "default: ollama"},
 	{"VBM_LLM_MODEL", "default: gpt-4o-mini"},
+	{"VBM_LLM_PROMPT_SUMMARIZE_FILE", "default summarize prompt embedded"},
+	{"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", "default suggest-tags prompt embedded"},
 	{"VBM_TTL_DAYS", "retention disabled"},
 	{"VBM_CORS_ORIGIN", ""},
 }

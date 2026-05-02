@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -26,16 +28,66 @@ const suggestTagsMaxChars = 8_000
 // suggestTagsMax is the hard upper bound on tags returned by SuggestTags.
 const suggestTagsMax = 3
 
-const summarizePrompt = "Summarize the following web page content for retrieval and search purposes. " +
+// maxPromptFileBytes caps the size of an external prompt markdown file.
+// Anything bigger almost certainly isn't a prompt.
+const maxPromptFileBytes = 16 * 1024
+
+// defaultSummarizePrompt is used when VBM_LLM_PROMPT_SUMMARIZE_FILE is unset
+// or unreadable. CR-0006.
+const defaultSummarizePrompt = "Summarize the following web page content for retrieval and search purposes. " +
 	"Target 200-400 words. Preserve technical terms, names, dates, key claims, and any code or commands mentioned. " +
 	"Output plain prose with no headers, no bullet lists, and no markdown."
 
+// defaultSuggestTagsPrompt is the system message for the SuggestTags call.
+// The user message is dynamically built with the existing taxonomy + title +
+// content; only this fixed system prompt is externalisable.
+const defaultSuggestTagsPrompt = "You generate tags for retrieval and curation of saved web pages. " +
+	"Output between 1 and 3 short tags (1-2 words each, lowercase, kebab-case, " +
+	"no leading '#'). " +
+	"Reuse from the existing tag list when applicable; otherwise create new tags " +
+	"that match the same style. " +
+	"Output STRICT JSON only, exactly in this shape: {\"tags\":[\"tag-one\",\"tag-two\"]}. " +
+	"No prose, no markdown fences, no explanation."
+
+// loadPromptOrDefault returns the contents of the file pointed to by envVar
+// (when set, readable, non-empty, and ≤ maxPromptFileBytes). Otherwise logs a
+// slog.Warn and returns the embedded fallback. CR-0006.
+func loadPromptOrDefault(envVar, fallback string) string {
+	path := os.Getenv(envVar)
+	if path == "" {
+		return fallback
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		slog.Warn("prompt file unreadable, using default", "env", envVar, "path", path, "err", err)
+		return fallback
+	}
+	if info.Size() > maxPromptFileBytes {
+		slog.Warn("prompt file exceeds size cap, using default", "env", envVar, "path", path, "size", info.Size(), "max", maxPromptFileBytes)
+		return fallback
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		slog.Warn("prompt file read failed, using default", "env", envVar, "path", path, "err", err)
+		return fallback
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		slog.Warn("prompt file empty, using default", "env", envVar, "path", path)
+		return fallback
+	}
+	slog.Info("loaded external prompt", "env", envVar, "path", path, "bytes", len(s))
+	return s
+}
+
 // Client is an OpenAI-compatible chat completions client.
 type Client struct {
-	url    string
-	model  string
-	apiKey string
-	http   *http.Client
+	url               string
+	model             string
+	apiKey            string
+	http              *http.Client
+	summarizePrompt   string
+	suggestTagsPrompt string
 }
 
 // New builds a client. embedURL is the embeddings URL (e.g.
@@ -55,6 +107,12 @@ func New(embedURL, model, apiKey string) (*Client, error) {
 		model:  model,
 		apiKey: apiKey,
 		http:   &http.Client{Timeout: 30 * time.Second},
+		summarizePrompt: loadPromptOrDefault(
+			"VBM_LLM_PROMPT_SUMMARIZE_FILE", defaultSummarizePrompt,
+		),
+		suggestTagsPrompt: loadPromptOrDefault(
+			"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", defaultSuggestTagsPrompt,
+		),
 	}, nil
 }
 
@@ -79,7 +137,7 @@ func (c *Client) Summarize(ctx context.Context, text string) (string, error) {
 	body, err := json.Marshal(map[string]any{
 		"model": c.model,
 		"messages": []map[string]string{
-			{"role": "system", "content": summarizePrompt},
+			{"role": "system", "content": c.summarizePrompt},
 			{"role": "user", "content": text},
 		},
 		"temperature": 0.2,
@@ -158,13 +216,7 @@ func (c *Client) SuggestTags(
 		existingLine = strings.Join(existing, ", ")
 	}
 
-	system := "You generate tags for retrieval and curation of saved web pages. " +
-		"Output between 1 and 3 short tags (1-2 words each, lowercase, kebab-case, " +
-		"no leading '#'). " +
-		"Reuse from the existing tag list when applicable; otherwise create new tags " +
-		"that match the same style. " +
-		"Output STRICT JSON only, exactly in this shape: {\"tags\":[\"tag-one\",\"tag-two\"]}. " +
-		"No prose, no markdown fences, no explanation."
+	system := c.suggestTagsPrompt
 
 	userMsg := fmt.Sprintf(
 		"Existing tags: %s\n\nTitle: %s\n\nContent:\n%s",

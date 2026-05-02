@@ -111,3 +111,30 @@ problema de distroless não ter `$HOME` setado por padrão e centraliza onde o
 volume é montado, evitando hacks tipo "set HOME=/data" no Dockerfile. Sem
 docker-compose nesta CR — o `docker run` é simples o bastante e quem quiser
 abstrai depois.
+
+## D-007 — Prompts do LLM externalizáveis via env+file com fallback embedded
+
+**Data:** 2026-05-02 — CR-0006
+
+`Summarize` e `SuggestTags` (em `internal/llm`) usam prompts carregados no
+startup do `Client`:
+
+- `VBM_LLM_PROMPT_SUMMARIZE_FILE` — caminho absoluto pra arquivo Markdown.
+- `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE` — idem.
+
+Quando setado e legível (≤ 16 KB, não-vazio), o conteúdo do arquivo é o system
+prompt. Caso contrário (ausente, vazio, grande demais, erro de leitura), cai
+no prompt hardcoded com `slog.Warn` indicando o motivo. Lido **uma vez** no
+construtor do `Client`; trocar prompt = restart o daemon.
+
+**Por quê:** afinar prompt é um ajuste fino frequente (idioma, tom, comprimento
+do resumo, estilo das tags). Recompilar Go pra cada tweak é fricção
+desproporcional. Externalizar via env+file mantém a UX simples (arquivo de
+texto, sem template engine, sem frontmatter) e o fallback embedded garante
+que quem não configurar nada continua funcionando exatamente como antes.
+Markdown como formato porque permite usuário estruturar prompt com headers e
+listas legíveis; modelos modernos lidam bem com markdown na system message.
+
+**Trade-off:** sem reload em runtime — decisão consciente. Reload exigiria
+file-watch ou SIGHUP, complicação desproporcional pra POC. Restart do daemon é
+~50ms.

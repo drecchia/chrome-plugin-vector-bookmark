@@ -181,6 +181,21 @@ function extractForSuggest(): {
 	};
 }
 
+// CR-0006: emit only title + meta for manual mode. The SW already has the
+// manualText from the popup; it concatenates the two in handlePageViewed.
+function extractManualMeta(): { ok: boolean; error?: string } {
+	if (hasSensitiveInputs()) return { ok: false, error: 'sensitive page' };
+	runtimeSend({
+		type: 'page_viewed',
+		url: location.href,
+		title: document.title,
+		text: '',
+		dwellMs: 0,
+		meta: extractMeta(),
+	});
+	return { ok: true };
+}
+
 // CR-0002: read the comment threads currently rendered in the DOM (no scroll).
 function extractYouTubeComments(maxN = 50): { ok: boolean; error?: string } {
 	const nodes = Array.from(
@@ -345,7 +360,8 @@ if (!window.__vbm_cs) {
 					| 'selection'
 					| 'yt_transcript'
 					| 'yt_comments'
-					| 'suggest_tags';
+					| 'suggest_tags'
+					| 'manual';
 			},
 			_sender,
 			sendResponse,
@@ -375,6 +391,14 @@ if (!window.__vbm_cs) {
 					// CR-0003: extracts but does NOT emit page_viewed.
 					// SW receives payload via sendResponse and forwards to /tags/suggest.
 					const r = extractForSuggest();
+					sendResponse(r);
+					return;
+				}
+				case 'manual': {
+					// CR-0006: emits page_viewed with empty text + meta. SW
+					// builds final text by concatenating metaText + pendingIngest.manualText.
+					const r = extractManualMeta();
+					if (r.ok) sent = true;
 					sendResponse(r);
 					return;
 				}

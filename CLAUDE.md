@@ -73,7 +73,7 @@ O popup tem **um único botão** "Index this site now". Clicá-lo abre um painel
 Modos suportados (campo `mode` em `IngestRequest`):
 1. `full_text` (default): SW envia `force_extract` → Readability + meta concatenados → `/ingest` chunka tudo.
 2. `llm_summary`: pipeline igual ao full_text **até** o daemon, que então chama `internal/llm.Summarize()` (provider OpenAI-compat reusando `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` + `VBM_LLM_MODEL`) e indexa apenas o resumo.
-3. `manual`: SW pula o content script e envia direto o texto digitado no `<textarea>`.
+3. `manual`: SW dispara `force_extract` com intent `manual` (CR-0006) — content script extrai apenas título+meta e emite `page_viewed` com `text=""`. SW concatena `metaText + "\n\n" + manualText` antes do /ingest. Resultado: chunk indexado contém título, meta block, e o que o usuário digitou — simétrico com os outros modos.
 4. `meta_only`: SW envia apenas título + meta tags (description/keywords/og*/author), sem corpo.
 
 Além desses 4 modos do daemon, o popup oferece **3 intents de extração** (CR-0002) que rodam **no client** e mapeiam para `mode: "manual"` no `/ingest`:
@@ -96,7 +96,7 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 - `internal/store/sqlite.go` — schema, migrations, Ingest, RecordVisit, Search (BM25+cosine RRF), Forget, ListTags/ListPagesByTag/GetPageTags
 - `internal/chunk/chunk.go` — sliding window chunker (512 tokens, overlap 64, mínimo 40)
 - `internal/embed/` — interface Embedder + StubEmbedder (zeros para dev)
-- `internal/llm/` — cliente OpenAI-compat para chat completions: `Summarize()` (resumo de página, CR-0001) e `SuggestTags()` (até 3 tags reusando taxonomia existente, CR-0003); usa o mesmo `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` do embedder, modelo via `VBM_LLM_MODEL`
+- `internal/llm/` — cliente OpenAI-compat para chat completions: `Summarize()` (resumo de página, CR-0001) e `SuggestTags()` (até 3 tags reusando taxonomia existente, CR-0003); usa o mesmo `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` do embedder, modelo via `VBM_LLM_MODEL`. **Prompts externalizáveis** via `VBM_LLM_PROMPT_SUMMARIZE_FILE` e `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE` (markdown, lidos no startup, fallback embedded — CR-0006).
 - `internal/queue/queue.go` — canal bufferizado cap 256, worker de ingest
 
 ### Extensão (TypeScript)

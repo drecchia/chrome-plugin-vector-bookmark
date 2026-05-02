@@ -78,6 +78,9 @@ interface PendingIngest {
 	mode: IngestMode;
 	tags: string[];
 	intent?: ExtractIntent;
+	// CR-0006: when set, handlePageViewed appends this to the metaText built
+	// from the page_viewed payload. Used by the `manual` intent flow.
+	manualText?: string;
 }
 const pendingIngest = new Map<number, PendingIngest>();
 
@@ -357,12 +360,18 @@ async function handlePageViewed(
 		const mode: IngestMode = pending?.mode ?? 'full_text';
 		const tags = pending?.tags ?? [];
 
-		const text =
-			mode === 'meta_only'
-				? metaText
-				: metaText
-					? `${metaText}\n\n${msg.text}`
-					: msg.text;
+		// CR-0006: manualText takes precedence — concatenated to metaText,
+		// the page body (msg.text) is ignored because we never extracted it.
+		let text: string;
+		if (pending?.manualText) {
+			text = metaText
+				? `${metaText}\n\n${pending.manualText}`
+				: pending.manualText;
+		} else if (mode === 'meta_only') {
+			text = metaText;
+		} else {
+			text = metaText ? `${metaText}\n\n${msg.text}` : msg.text;
+		}
 
 		await ingest({
 			url: cleanUrl,
@@ -580,7 +589,26 @@ chrome.runtime.onMessage.addListener(
 					return;
 				}
 				const tabId = tab.id;
-				const intent = msg.intent;
+				let intent = msg.intent;
+				let manualText: string | undefined;
+
+				// CR-0006: manual mode goes through the content script via
+				// intent='manual' so we can grab title + meta. The popup's
+				// manualText is stashed in pendingIngest and concatenated in
+				// handlePageViewed.
+				if (!intent && msg.mode === 'manual') {
+					const t = (msg.manualText ?? '').trim();
+					if (!t) {
+						sendResponse({
+							ok: false,
+							error: 'Manual text is empty',
+						});
+						return;
+					}
+					intent = 'manual';
+					manualText = t;
+				}
+
 				// CR-0002: when an extraction intent is provided, the content
 				// script does the heavy lifting and the daemon sees mode=manual
 				// (stores text as-is, no LLM/Readability post-processing).
@@ -589,42 +617,7 @@ chrome.runtime.onMessage.addListener(
 					: (msg.mode ?? 'full_text');
 				const tags = msg.tags ?? [];
 
-				// Manual mode bypasses the content script: the popup already
-				// supplies the text via msg.manualText. Skip this branch when
-				// an intent is set — those still go through the content script.
-				if (mode === 'manual' && !intent) {
-					const manualText = (msg.manualText ?? '').trim();
-					if (!manualText) {
-						sendResponse({
-							ok: false,
-							error: 'Manual text is empty',
-						});
-						return;
-					}
-					const cleanUrl = sanitizeUrl(tab.url);
-					ingest({
-						url: cleanUrl,
-						title: tab.title ?? cleanUrl,
-						text: manualText,
-						visitTs: Date.now(),
-						dwellMs: 0,
-						domain: new URL(cleanUrl).hostname,
-						tags,
-						setTags: true,
-						mode: 'manual',
-					})
-						.then(() => {
-							setBadge(tabId, 'indexed');
-							sendResponse({ ok: true });
-						})
-						.catch((e) => {
-							setBadge(tabId, 'disconnected');
-							sendResponse({ ok: false, error: String(e) });
-						});
-					return;
-				}
-
-				pendingIngest.set(tabId, { mode, tags, intent });
+				pendingIngest.set(tabId, { mode, tags, intent, manualText });
 				const doExtract = () => {
 					chrome.tabs.sendMessage(
 						tabId,

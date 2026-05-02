@@ -56,7 +56,8 @@ export type ExtractIntent =
 	| 'selection'
 	| 'yt_transcript'
 	| 'yt_comments'
-	| 'suggest_tags';
+	| 'suggest_tags'
+	| 'manual';
 
 // ---- Tag suggestion (CR-0003) ----
 export interface SuggestTagsRequest {
