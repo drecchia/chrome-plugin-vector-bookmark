@@ -168,6 +168,23 @@ function isConnected(): boolean {
 	);
 }
 
+// Debounce repeated /visit calls for the same URL within this window —
+// prevents the timeline from showing the same page over and over when the
+// user idles or refreshes. Different URLs (even on the same domain) bypass
+// the debounce, so subpage navigation still records.
+const RECORD_DEBOUNCE_MS = 30 * 60 * 1000;
+const recentVisits = new Map<string, number>();
+function rememberVisit(url: string) {
+	const now = Date.now();
+	// Sweep expired entries on every insert — keeps the Map bounded by the
+	// number of distinct URLs visited within the last RECORD_DEBOUNCE_MS,
+	// not by the full history of the SW lifetime.
+	for (const [u, ts] of recentVisits) {
+		if (now - ts >= RECORD_DEBOUNCE_MS) recentVisits.delete(u);
+	}
+	recentVisits.set(url, now);
+}
+
 // CR-008: user-managed domain blacklist (suffix match).
 let blockedDomains: string[] = [];
 
@@ -298,6 +315,13 @@ async function handlePageVisited(
 	}
 
 	const cleanUrl = sanitizeUrl(msg.url);
+	// Skip the network round-trip if the same URL was recorded recently.
+	// Badge still goes to 'visited' so the user sees we acknowledged the page.
+	const lastTs = recentVisits.get(cleanUrl);
+	if (lastTs !== undefined && Date.now() - lastTs < RECORD_DEBOUNCE_MS) {
+		if (tabId !== undefined) setBadge(tabId, 'visited');
+		return;
+	}
 	try {
 		await recordVisit({
 			url: cleanUrl,
@@ -307,6 +331,7 @@ async function handlePageVisited(
 			domain: new URL(cleanUrl).hostname,
 			meta: msg.meta,
 		});
+		rememberVisit(cleanUrl);
 		if (tabId !== undefined) setBadge(tabId, 'visited');
 	} catch {
 		if (tabId !== undefined) setBadge(tabId, 'disconnected');
@@ -385,8 +410,19 @@ async function handlePageViewed(
 			mode,
 		});
 		if (tabId !== undefined) setBadge(tabId, 'indexed');
-	} catch {
+		// Notify the popup if it's listening (popup may be closed — silently dropped).
+		chrome.runtime
+			.sendMessage({ type: 'ingest_complete', ok: true })
+			.catch(() => {});
+	} catch (e) {
 		if (tabId !== undefined) setBadge(tabId, 'disconnected');
+		chrome.runtime
+			.sendMessage({
+				type: 'ingest_complete',
+				ok: false,
+				error: String((e as Error)?.message ?? e),
+			})
+			.catch(() => {});
 	}
 }
 

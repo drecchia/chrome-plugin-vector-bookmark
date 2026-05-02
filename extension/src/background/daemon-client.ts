@@ -13,7 +13,14 @@ import { getDaemonConfig, getDaemonBase } from './native-bridge';
 
 async function checkResponse(res: Response): Promise<void> {
 	if (!res.ok) {
-		throw new Error(`Daemon HTTP error ${res.status}: ${res.statusText}`);
+		let msg = `${res.status} ${res.statusText}`;
+		try {
+			const body = await res.json();
+			if (body?.error) msg = body.error;
+		} catch {
+			// non-JSON body — keep status text
+		}
+		throw new Error(msg);
 	}
 }
 

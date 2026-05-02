@@ -118,6 +118,33 @@ export default function App() {
 		});
 	}, []);
 
+	// Listen for the SW broadcast that fires after /ingest resolves.
+	// Replaces the transient "Indexing…" toast with the real outcome and
+	// updates page-status state so the UI matches the daemon.
+	useEffect(() => {
+		const listener = (msg: {
+			type?: string;
+			ok?: boolean;
+			error?: string;
+		}) => {
+			if (msg?.type !== 'ingest_complete') return;
+			if (msg.ok) {
+				flash('Indexed');
+				setPageIndexed(true);
+				setPageExists(true);
+				chrome.runtime.sendMessage({ type: 'popup_list_tags' }, (r) => {
+					if (chrome.runtime.lastError) return;
+					if (Array.isArray(r?.tags))
+						setKnownTags(r.tags as TagCount[]);
+				});
+			} else {
+				flash(msg.error ?? 'Indexing failed', false);
+			}
+		};
+		chrome.runtime.onMessage.addListener(listener);
+		return () => chrome.runtime.onMessage.removeListener(listener);
+	}, []);
+
 	function flash(text: string, ok = true) {
 		setMsg({ text, ok });
 		setTimeout(() => setMsg(null), 2500);
@@ -213,16 +240,13 @@ export default function App() {
 		chrome.runtime.sendMessage(payload, (res) => {
 			if (chrome.runtime.lastError) return;
 			if (res?.ok) {
-				flash('Indexed');
+				// Extraction succeeded — but /ingest still hasn't been called.
+				// Show a non-expiring "Indexing…" toast; the `ingest_complete`
+				// listener (mounted in useEffect) will replace it with the real
+				// success/error result from the daemon.
+				setMsg({ text: 'Indexing…', ok: true });
 				setPanelOpen(false);
 				setManualText('');
-				setPageIndexed(true);
-				setPageExists(true);
-				chrome.runtime.sendMessage({ type: 'popup_list_tags' }, (r) => {
-					if (chrome.runtime.lastError) return;
-					if (Array.isArray(r?.tags))
-						setKnownTags(r.tags as TagCount[]);
-				});
 			} else {
 				flash(res?.error ?? 'Could not index page', false);
 			}
@@ -475,6 +499,13 @@ export default function App() {
 
 	return (
 		<div style={s.container}>
+			<style>{`
+				input::placeholder, textarea::placeholder {
+					color: #c0c4cc;
+					font-style: italic;
+					opacity: 1;
+				}
+			`}</style>
 			{/* Header */}
 			<div style={s.header}>
 				<p style={s.title}>Vector Bookmark</p>
@@ -569,7 +600,7 @@ export default function App() {
 							<input
 								style={s.input}
 								type="text"
-								placeholder="URL or domain..."
+								placeholder="e.g. example.com or full URL"
 								value={forgetValue}
 								onChange={(e) => setForgetValue(e.target.value)}
 								onKeyDown={(e) =>
@@ -690,12 +721,7 @@ export default function App() {
 					}}
 				>
 					<div>
-						<div style={s.label}>
-							Tags{' '}
-							<span style={{ fontWeight: 400, color: '#9ca3af' }}>
-								(comma-separated)
-							</span>
-						</div>
+						<div style={s.label}>Tags</div>
 						<div
 							style={{
 								display: 'flex',
@@ -707,7 +733,7 @@ export default function App() {
 								style={{ ...s.input, flex: 1 }}
 								type="text"
 								list="vbm-known-tags"
-								placeholder="read-later, ai, work"
+								placeholder="e.g. ai, work, read-later"
 								value={tagsCSV}
 								onChange={(e) => setTagsCSV(e.target.value)}
 							/>
