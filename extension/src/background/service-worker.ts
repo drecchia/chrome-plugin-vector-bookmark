@@ -17,6 +17,7 @@ import {
 	getDaemonConfig,
 } from './native-bridge';
 import defaultBlacklist from './default-blacklist.json';
+import { sanitizeUrl, matchesAnyBlacklist } from '../lib/url';
 
 interface ForgetRequest {
 	type: 'url' | 'domain' | 'timerange';
@@ -189,23 +190,7 @@ function rememberVisit(url: string) {
 let blockedDomains: string[] = [];
 
 function isBlockedByUser(hostname: string): boolean {
-	const h = hostname.toLowerCase();
-	return blockedDomains.some((entry) => {
-		if (entry.startsWith('/')) {
-			// Support /pattern/ and /pattern/flags formats.
-			const lastSlash = entry.lastIndexOf('/');
-			if (lastSlash > 0) {
-				const pattern = entry.slice(1, lastSlash);
-				const flags = entry.slice(lastSlash + 1);
-				try {
-					return new RegExp(pattern, flags || 'i').test(h);
-				} catch {
-					return false;
-				}
-			}
-		}
-		return h === entry || h.endsWith('.' + entry);
-	});
+	return matchesAnyBlacklist(hostname, blockedDomains);
 }
 
 // CR-010: load blacklist from daemon on startup; refresh every 60s.
@@ -247,38 +232,6 @@ Promise.all(DEFAULT_BLOCKED_ALL.map((d) => addToBlacklist(d)))
 
 // P2-04: debounce omnibox to avoid a fetch on every keystroke.
 let omniboxTimer: ReturnType<typeof setTimeout> | null = null;
-
-// P2-10: strip common tracking/session query params before indexing.
-function sanitizeUrl(url: string): string {
-	try {
-		const u = new URL(url);
-		const trackingParams = [
-			'utm_source',
-			'utm_medium',
-			'utm_campaign',
-			'utm_term',
-			'utm_content',
-			'fbclid',
-			'gclid',
-			'msclkid',
-			'ref',
-			'source',
-			'token',
-			'access_token',
-			'api_key',
-			'key',
-			'secret',
-			'session',
-			'sid',
-			'sessionid',
-			'session_id',
-		];
-		for (const p of trackingParams) u.searchParams.delete(p);
-		return u.toString();
-	} catch {
-		return url;
-	}
-}
 
 function escapeXml(s: string): string {
 	return s

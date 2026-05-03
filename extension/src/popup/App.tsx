@@ -24,6 +24,7 @@ import {
 	saveDwellThreshold,
 } from '../background/native-bridge';
 import { reindex, getReindexStatus } from '../background/daemon-client';
+import { parseTagsCSV, mergeTagsCSV } from '../lib/tags';
 
 function formatAgo(ms: number): string {
 	if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
@@ -164,37 +165,8 @@ export default function App() {
 		);
 	}
 
-	function parseTagsCSV(csv: string): string[] {
-		return csv
-			.split(',')
-			.map((t) => t.trim())
-			.filter((t) => t.length > 0);
-	}
-
 	function handleToggleIndexPanel() {
 		setPanelOpen((v) => !v);
-	}
-
-	// CR-0003: merge generated tags into the existing CSV string, preserving
-	// order and dropping case-insensitive duplicates.
-	function mergeTagsCSV(existing: string, generated: string[]): string {
-		const seen = new Set<string>();
-		const out: string[] = [];
-		for (const raw of existing.split(',')) {
-			const t = raw.trim();
-			if (!t) continue;
-			const k = t.toLowerCase();
-			if (seen.has(k)) continue;
-			seen.add(k);
-			out.push(t);
-		}
-		for (const t of generated) {
-			const k = t.trim().toLowerCase();
-			if (!k || seen.has(k)) continue;
-			seen.add(k);
-			out.push(t.trim());
-		}
-		return out.join(', ');
 	}
 
 	function handleSuggestTags() {
