@@ -370,7 +370,7 @@ func (s *Store) Ingest(req IngestRequest) error {
 	// Upsert page — set indexed=1 since this is a full ingest with text.
 	// Source is upgraded to "indexed" only when the request says so; a
 	// passive history hit must never demote a previous "indexed" mark.
-	res, err := tx.Exec(`
+	if _, err := tx.Exec(`
 		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, source, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 		ON CONFLICT(url_hash) DO UPDATE SET
@@ -381,18 +381,15 @@ func (s *Store) Ingest(req IngestRequest) error {
 			model_ver=excluded.model_ver,
 			indexed=1,
 			source=CASE WHEN excluded.source='indexed' THEN 'indexed' ELSE pages.source END
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), source, now)
-	if err != nil {
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), source, now); err != nil {
 		return fmt.Errorf("upsert page: %w", err)
 	}
 
-	pageID, err := res.LastInsertId()
-	if err != nil || pageID == 0 {
-		// ON CONFLICT DO UPDATE doesn't return a new LastInsertId in all drivers; fetch it
-		row := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash)
-		if err2 := row.Scan(&pageID); err2 != nil {
-			return fmt.Errorf("get page id: %w", err2)
-		}
+	// LastInsertId() is unreliable across drivers after ON CONFLICT DO UPDATE
+	// (modernc/sqlite may return a stale rowid). Always fetch by url_hash.
+	var pageID int64
+	if err := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash).Scan(&pageID); err != nil {
+		return fmt.Errorf("get page id: %w", err)
 	}
 
 	if err := persistTags(tx, pageID, req, now); err != nil {
@@ -447,11 +444,18 @@ func (s *Store) Embedder() embed.Embedder { return s.embedder }
 
 // IngestPrepared writes a pre-embedded PreparedIngest in a single transaction.
 // No embedding happens here — this runs on the single DB-writer goroutine.
+//
+// Accepts Chunks=nil for tag-only updates (text was too short for chunking
+// but the request carries a tag delta). In that case the page row is upserted
+// without promoting `indexed` and the chunk loop is skipped — the goal is to
+// land req.Tags / req.SetTags so they don't get silently dropped.
 func (s *Store) IngestPrepared(p PreparedIngest) error {
-	if len(p.Chunks) == 0 {
+	req := p.Req
+	hasChunks := len(p.Chunks) > 0
+	hasTagDelta := req.SetTags || len(req.Tags) > 0
+	if !hasChunks && !hasTagDelta {
 		return nil
 	}
-	req := p.Req
 	urlHash := chunk.Hash(req.URL)
 	now := time.Now().UnixMilli()
 
@@ -465,27 +469,31 @@ func (s *Store) IngestPrepared(p PreparedIngest) error {
 	if source == "" {
 		source = "history"
 	}
-	res, err := tx.Exec(`
+	insertIndexed := 0
+	if hasChunks {
+		insertIndexed = 1
+	}
+	// On conflict, never demote indexed (MAX with existing) and only set
+	// excluded values when this run actually has chunks; otherwise keep prior.
+	if _, err := tx.Exec(`
 		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(url_hash) DO UPDATE SET
 			title=excluded.title,
 			domain=excluded.domain,
 			visit_ts=excluded.visit_ts,
 			dwell_ms=excluded.dwell_ms,
-			model_ver=excluded.model_ver,
-			indexed=1,
+			model_ver=CASE WHEN excluded.indexed=1 THEN excluded.model_ver ELSE pages.model_ver END,
+			indexed=CASE WHEN excluded.indexed=1 OR pages.indexed=1 THEN 1 ELSE 0 END,
 			source=CASE WHEN excluded.source='indexed' THEN 'indexed' ELSE pages.source END
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), source, now)
-	if err != nil {
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), insertIndexed, source, now); err != nil {
 		return fmt.Errorf("upsert page: %w", err)
 	}
-	pageID, err := res.LastInsertId()
-	if err != nil || pageID == 0 {
-		row := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash)
-		if err2 := row.Scan(&pageID); err2 != nil {
-			return fmt.Errorf("get page id: %w", err2)
-		}
+	// LastInsertId() is unreliable across drivers after ON CONFLICT DO UPDATE
+	// (modernc/sqlite may return a stale rowid). Always fetch by url_hash.
+	var pageID int64
+	if err := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash).Scan(&pageID); err != nil {
+		return fmt.Errorf("get page id: %w", err)
 	}
 
 	if err := persistTags(tx, pageID, req, now); err != nil {

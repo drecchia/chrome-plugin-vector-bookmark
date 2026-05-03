@@ -211,6 +211,79 @@ func TestIngestPrepared_PersistsTags(t *testing.T) {
 	requireTags(t, s, url, []string{"ai", "read-later"})
 }
 
+// TestIngestPrepared_SetTagsReplacesOnExistingURL guards a bug where the
+// production hot-path (queue → IngestPrepared) failed to replace tags on a
+// re-ingest of an URL that already had a row. The MAX(...) inside ON CONFLICT
+// DO UPDATE SET was failing under modernc/sqlite, rolling back the whole tx
+// and leaving the previous tags intact.
+func TestIngestPrepared_SetTagsReplacesOnExistingURL(t *testing.T) {
+	s := newTestStore(t)
+	url := "https://example.com/replace-via-prepared"
+	mkPrepared := func(tags []string, setTags bool) PreparedIngest {
+		return PreparedIngest{
+			Req: IngestRequest{
+				URL: url, Domain: "example.com", Title: "t",
+				Text: longText(120), VisitTs: nowMs(),
+				Tags: tags, SetTags: setTags,
+				Source: "indexed",
+			},
+			Chunks: []PreparedChunk{{
+				Index: 0, Text: longText(120), Hash: "h",
+				Vec: make([]float32, 8),
+			}},
+		}
+	}
+	if err := s.IngestPrepared(mkPrepared([]string{"old-a", "old-b"}, true)); err != nil {
+		t.Fatalf("first IngestPrepared: %v", err)
+	}
+	requireTags(t, s, url, []string{"old-a", "old-b"})
+
+	if err := s.IngestPrepared(mkPrepared([]string{"new-a", "new-b"}, true)); err != nil {
+		t.Fatalf("second IngestPrepared: %v", err)
+	}
+	requireTags(t, s, url, []string{"new-a", "new-b"})
+}
+
+// TestIngestPrepared_TagOnlyUpdatePersists guards the bug where modes that
+// produce short text (llm_summary / meta_only / manual) had their tags silently
+// dropped because the embed worker bailed on chunks==0. A tag-only PreparedIngest
+// (Chunks=nil) must still upsert tags without demoting `indexed`.
+func TestIngestPrepared_TagOnlyUpdatePersists(t *testing.T) {
+	s := newTestStore(t)
+	url := "https://example.com/tag-only"
+
+	// First: real ingest with chunks + tag [a]. Page becomes indexed=1.
+	mustIngest(t, s, IngestRequest{
+		URL: url, Domain: "example.com", Title: "t",
+		Text: longText(120), VisitTs: nowMs(),
+		Tags: []string{"a"}, SetTags: true,
+		Source: "indexed",
+	})
+	exists, indexed, err := s.PageStatus(url)
+	if err != nil || !exists || !indexed {
+		t.Fatalf("setup PageStatus: exists=%v indexed=%v err=%v", exists, indexed, err)
+	}
+
+	// Tag-only update: Chunks=nil, new tag set [b]. Must replace [a]→[b]
+	// and KEEP indexed=1 (no demotion just because chunks were skipped).
+	if err := s.IngestPrepared(PreparedIngest{
+		Req: IngestRequest{
+			URL: url, Domain: "example.com", Title: "t",
+			Text: "", VisitTs: nowMs(),
+			Tags: []string{"b"}, SetTags: true,
+			Source: "indexed",
+		},
+		Chunks: nil,
+	}); err != nil {
+		t.Fatalf("tag-only IngestPrepared: %v", err)
+	}
+	requireTags(t, s, url, []string{"b"})
+	exists, indexed, _ = s.PageStatus(url)
+	if !exists || !indexed {
+		t.Errorf("indexed flag was demoted by tag-only update: exists=%v indexed=%v", exists, indexed)
+	}
+}
+
 // ── ListTags / ListPagesByTag ────────────────────────────────────────────────
 
 func TestListTags_CountsPagesPerTag(t *testing.T) {

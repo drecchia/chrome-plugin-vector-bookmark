@@ -87,9 +87,18 @@ func (q *Queue) embedWorker() {
 	for req := range q.inbound {
 		chunks := chunk.SplitIntoChunks(req.Text)
 		if len(chunks) == 0 {
-			if err := q.store.RemoveQueueItem(req.URL); err != nil {
-				slog.Warn("remove queue item (too-short) error", "url", req.URL, "err", err)
+			// Text too short for chunking. Skip embedding entirely, but still
+			// flush the request to the writer when there's a tag delta — tags
+			// are metadata that must persist regardless of the body length
+			// (otherwise llm_summary/meta_only/manual modes silently drop tags).
+			hasTagDelta := req.SetTags || len(req.Tags) > 0
+			if !hasTagDelta {
+				if err := q.store.RemoveQueueItem(req.URL); err != nil {
+					slog.Warn("remove queue item (too-short) error", "url", req.URL, "err", err)
+				}
+				continue
 			}
+			q.writeCh <- store.PreparedIngest{Req: req, Chunks: nil}
 			continue
 		}
 		prepared := make([]store.PreparedChunk, 0, len(chunks))

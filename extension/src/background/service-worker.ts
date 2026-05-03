@@ -389,6 +389,7 @@ chrome.runtime.onMessage.addListener(
 			mode?: IngestMode;
 			manualText?: string;
 			intent?: ExtractIntent;
+			url?: string;
 		},
 		sender: chrome.runtime.MessageSender,
 		sendResponse: (response?: unknown) => void,
@@ -446,18 +447,29 @@ chrome.runtime.onMessage.addListener(
 		}
 
 		if (msg.type === 'popup_page_status') {
-			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-				const url = tabs[0]?.url;
-				if (!url) {
+			// Popup may pass the URL it queried directly so we always look up
+			// the same tab the user is staring at (avoids a race where SW's
+			// own chrome.tabs.query sees a different active tab). Falls back
+			// to active-tab query when missing for backwards compatibility.
+			const lookup = (raw: string | undefined) => {
+				if (!raw) {
 					sendResponse({ exists: false, indexed: false });
 					return;
 				}
-				pageStatus(url)
+				pageStatus(sanitizeUrl(raw))
 					.then((status) => sendResponse(status))
 					.catch(() =>
 						sendResponse({ exists: false, indexed: false }),
 					);
-			});
+			};
+			if (typeof msg.url === 'string' && msg.url) {
+				lookup(msg.url);
+			} else {
+				chrome.tabs.query(
+					{ active: true, currentWindow: true },
+					(tabs) => lookup(tabs[0]?.url),
+				);
+			}
 			return true;
 		}
 

@@ -98,7 +98,7 @@ export default function App() {
 				!url.startsWith('chrome-extension://')
 			) {
 				chrome.runtime.sendMessage(
-					{ type: 'popup_page_status' },
+					{ type: 'popup_page_status', url },
 					(res) => {
 						if (chrome.runtime.lastError) return;
 						setPageExists(res?.exists ?? false);
@@ -166,7 +166,24 @@ export default function App() {
 	}
 
 	function handleToggleIndexPanel() {
-		setPanelOpen((v) => !v);
+		setPanelOpen((v) => {
+			const next = !v;
+			// Opening: re-fetch the page's current tags so the input reflects
+			// the latest state. Skips when the user has already typed something
+			// to avoid clobbering in-flight input.
+			if (next && currentTabUrl && tagsCSV.trim() === '') {
+				chrome.runtime.sendMessage(
+					{ type: 'popup_page_status', url: currentTabUrl },
+					(res) => {
+						if (chrome.runtime.lastError) return;
+						if (Array.isArray(res?.tags) && res.tags.length > 0) {
+							setTagsCSV((res.tags as string[]).join(', '));
+						}
+					},
+				);
+			}
+			return next;
+		});
 	}
 
 	function handleSuggestTags() {
@@ -704,7 +721,6 @@ export default function App() {
 							<input
 								style={{ ...s.input, flex: 1 }}
 								type="text"
-								list="vbm-known-tags"
 								placeholder="e.g. ai, work, read-later"
 								value={tagsCSV}
 								onChange={(e) => setTagsCSV(e.target.value)}
@@ -733,13 +749,6 @@ export default function App() {
 								{suggestLoading ? '…' : '✨'}
 							</button>
 						</div>
-						<datalist id="vbm-known-tags">
-							{knownTags.map((t) => (
-								<option key={t.tag} value={t.tag}>
-									{t.count}
-								</option>
-							))}
-						</datalist>
 					</div>
 
 					<div>
