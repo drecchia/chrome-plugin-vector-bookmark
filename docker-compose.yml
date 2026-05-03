@@ -3,26 +3,35 @@ services:
     build:
       context: ./daemon
       dockerfile: Dockerfile
+    image: vbmd:dev
     container_name: vbmd
 
-    environment:
-      # Fixed port — daemon binds 0.0.0.0:7532 inside the container.
-      # Docker maps it to 127.0.0.1:7532 on the host (loopback-only).
-      VBM_PORT: "7532"
+    # Container-friendly defaults (port 7532, bind 0.0.0.0, data dir /data,
+    # log info) are baked into the image. To tune them or enable LLM features,
+    # uncomment an `environment:` block below. Secrets belong in `.env` /
+    # shell env, not committed inline.
+    #
+    # environment:
+    #   VBM_LOG_LEVEL: "debug"
+    #   VBM_TTL_DAYS: "90"
+    #   VBM_EMBED_URL: "https://api.openai.com/v1/embeddings"
+    #   VBM_EMBED_API_KEY: "${VBM_EMBED_API_KEY}"
+    #   VBM_LLM_MODEL: "gpt-4o-mini"
 
+    # Loopback-only on the host — never expose this on a public interface
+    # without adding auth in front.
     ports:
       - "127.0.0.1:7532:7532"
 
-    # Share the data directory with the host so that:
-    #   1. vbm.db persists across container restarts
-    #   2. session.json (port + token) is readable by the NM host shim
-    #      (vbmd nm-host) spawned by Chrome on the host machine
+    # Persist vbm.db across container restarts. Path inside the container is
+    # /data (matches VBM_DATA_DIR in the image), the host side is the same
+    # location the native install uses, so a switch from systemd → docker
+    # keeps your data.
     volumes:
-      - ${HOME}/.local/share/vbm:/home/vbm/.local/share/vbm
+      - ${HOME}/.local/share/vbm:/data
 
     restart: unless-stopped
 
-    # Log to stdout/stderr (journald or docker logs)
     logging:
       driver: json-file
       options:
