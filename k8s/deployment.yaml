@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vbmd
+  namespace: vbm
+  labels:
+    app: vbmd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vbmd
+  template:
+    metadata:
+      labels:
+        app: vbmd
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: vbmd
+          # Replace <DOCKERHUB_USER> with your Docker Hub username.
+          # Use an explicit version tag in production instead of :latest.
+          image: <DOCKERHUB_USER>/vbmd:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 7532
+              protocol: TCP
+
+          env:
+            # These match the image defaults but are listed explicitly so
+            # changes in the image don't silently surprise the cluster.
+            - name: VBM_PORT
+              value: "7532"
+            - name: VBM_BIND
+              value: "0.0.0.0"
+            - name: VBM_DATA_DIR
+              value: "/data"
+            - name: VBM_LOG_LEVEL
+              value: "info"
+
+            # Optional tuning — uncomment to activate.
+            # - name: VBM_TTL_DAYS
+            #   value: "90"
+            # - name: VBM_LLM_MODEL
+            #   value: "gpt-4o-mini"
+            # - name: VBM_EMBED_URL
+            #   value: "https://api.openai.com/v1/embeddings"
+            # - name: VBM_EMBED_FORMAT
+            #   value: "openai"
+
+            # LLM API key from secret (only needed when VBM_EMBED_URL is set).
+            # - name: VBM_EMBED_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: vbm-llm-secret
+            #       key: VBM_EMBED_API_KEY
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vbm-data-pvc

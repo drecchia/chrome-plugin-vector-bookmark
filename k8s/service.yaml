@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vbmd
+  namespace: vbm
+  labels:
+    app: vbmd
+spec:
+  type: ClusterIP
+  selector:
+    app: vbmd
+  ports:
+    - name: http
+      port: 7532
+      targetPort: http
+      protocol: TCP

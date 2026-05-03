@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: vbm-data-pv
+  labels:
+    app: vbmd
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  # hostPath is suitable for single-node clusters (minikube, k3s, Docker Desktop).
+  # Replace with your cloud provider's storage class for multi-node clusters.
+  hostPath:
+    path: /var/lib/vbm/data
+    type: DirectoryOrCreate
