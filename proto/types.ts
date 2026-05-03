@@ -80,10 +80,14 @@ export interface SearchResult {
 	url: string;
 	title: string;
 	snippet: string;
+	snippets: string[];
 	/** Unix milliseconds */
 	visitTs: number;
 	score: number;
 	domain: string;
+	tags: string[];
+	/** "indexed" = manual popup ingest; "history" = passive dwell capture */
+	source: 'indexed' | 'history';
 }
 
 export interface SearchResponse {

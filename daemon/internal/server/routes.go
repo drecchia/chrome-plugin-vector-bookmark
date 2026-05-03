@@ -155,6 +155,14 @@ h1{font-size:15px;font-weight:600}
 .hist-page-title:hover{color:#6366f1}
 .hist-kws{display:flex;flex-wrap:wrap;gap:4px}
 .hist-kw{font-size:11px;color:#6b7280;background:#f3f4f6;border-radius:3px;padding:1px 6px}
+.hist-kw.active{background:#111;color:#fff}
+.confidence{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#6b7280;margin-left:auto;margin-right:10px}
+.confidence-bar{display:inline-block;width:60px;height:6px;background:#f3f4f6;border-radius:3px;overflow:hidden;vertical-align:middle}
+.confidence-fill{display:block;height:100%;background:linear-gradient(90deg,#ef4444 0%,#f59e0b 50%,#10b981 100%)}
+.source-badge{font-size:10px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:1px 6px;border-radius:3px}
+.source-badge.indexed{background:#dcfce7;color:#166534}
+.source-badge.history{background:#e0e7ff;color:#3730a3}
+.snippet+.snippet{margin-top:4px;padding-top:4px;border-top:1px dashed #f3f4f6}
 </style>
 </head>
 <body>
@@ -242,12 +250,22 @@ function search(){
   fetch(url).then(function(r){return r.json()}).then(function(data){
     var list=data.results||[]
     if(!list.length){res.innerHTML='<div class="empty">No results</div>';return}
+    var top=list[0].score||0
     res.innerHTML='<div class="count">'+list.length+' result'+(list.length>1?'s':'')+'</div>'+list.map(function(r){
+      var pct=top>0?Math.round((r.score/top)*100):0
+      var snips=(r.snippets&&r.snippets.length?r.snippets:[r.snippet||''])
+        .map(function(s){return '<div class="snippet">'+esc(s)+'</div>'}).join('')
+      var tags=(r.tags||[]).map(function(t){return '<span class="hist-kw">'+esc(t)+'</span>'}).join('')
+      var conf=top>0?'<span class="confidence" title="'+pct+'% relative to top match"><span class="confidence-bar"><span class="confidence-fill" style="width:'+pct+'%"></span></span><span>'+pct+'%</span></span>':''
+      var src=r.source==='indexed'?'indexed':'history'
+      var srcLabel=src==='indexed'?'indexed':'history'
+      var badge='<span class="source-badge '+src+'" title="'+(src==='indexed'?'Manually indexed via the popup':'Captured passively from your browsing history')+'">'+srcLabel+'</span>'
       return '<div class="result">'+
         '<button class="forget-btn" data-url="'+esc(r.url)+'">forget</button>'+
-        '<div class="result-meta"><span class="domain">'+esc(r.domain)+'</span><span class="date">'+fmt(r.visitTs)+'</span></div>'+
+        '<div class="result-meta"><span class="domain">'+esc(r.domain)+'</span><span class="date">'+fmt(r.visitTs)+'</span>'+badge+conf+'</div>'+
         '<a class="result-title" href="'+esc(r.url)+'" target="_blank">'+esc(r.title||r.url)+'</a>'+
-        '<div class="snippet">'+esc(r.snippet)+'</div>'+
+        snips+
+        (tags?'<div class="hist-kws" style="margin-top:6px">'+tags+'</div>':'')+
       '</div>'
     }).join('')
   }).catch(function(){res.innerHTML='<div class="empty">Search failed</div>'})
@@ -534,7 +552,7 @@ function tagsRender(){
   fetch('/tags').then(function(r){return r.json()}).then(function(d){
     var tags=d.tags||[]
     if(!tags.length){
-      tagsList.innerHTML='<div class="empty" style="padding:20px 0">No tags yet — use "Index with tag" in the popup</div>'
+      tagsList.innerHTML='<div class="empty" style="padding:20px 0">No tags yet — open the popup, click <b>Index this site now</b> and fill the <b>Tags</b> field before <b>Confirm</b>.</div>'
       tagsPages.innerHTML=''
       return
     }
@@ -552,11 +570,14 @@ function tagsLoadPages(t){
     var pages=d.pages||[]
     if(!pages.length){tagsPages.innerHTML='<div class="empty">No pages with this tag</div>';return}
     tagsPages.innerHTML='<div class="count">'+pages.length+' page'+(pages.length>1?'s':'')+'</div>'+pages.map(function(p){
-      var others=(p.tags||[]).filter(function(x){return x!==t}).map(function(x){return '<span class="hist-kw">'+esc(x)+'</span>'}).join('')
+      var allTags=(p.tags||[]).map(function(x){
+        var cls='hist-kw'+(x===t?' active':'')
+        return '<span class="'+cls+'">'+esc(x)+'</span>'
+      }).join('')
       return '<div class="result">'+
         '<div class="result-meta"><span class="domain">'+esc(p.domain)+'</span><span class="date">'+fmt(p.visitTs)+'</span></div>'+
         '<a class="result-title" href="'+esc(p.url)+'" target="_blank">'+esc(p.title||p.url)+'</a>'+
-        (others?'<div class="hist-kws" style="margin-top:4px">'+others+'</div>':'')+
+        (allTags?'<div class="hist-kws" style="margin-top:4px">'+allTags+'</div>':'')+
       '</div>'
     }).join('')
   }).catch(function(){tagsPages.innerHTML='<div class="empty">Failed to load</div>'})
@@ -568,6 +589,7 @@ tagsList.addEventListener('click',function(e){
 })
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
   if(t.dataset.panel==='tags-panel')tagsRender()
+  if(t.dataset.panel==='search-panel')tagsLoadDropdown()
 })})
 tagsLoadDropdown()
 </script>
@@ -756,6 +778,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 					VisitTs: vr.VisitTs,
 					DwellMs: vr.DwellMs,
 					Domain:  vr.Domain,
+					Source:  "history",
 				}
 				q.Enqueue(ir)
 			}
@@ -804,6 +827,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Domain:  ir.Domain,
 				Tags:    ir.Tags,
 				SetTags: ir.SetTags,
+				Source:  "indexed",
 			}
 			q.Enqueue(ireq)
 			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
@@ -840,28 +864,63 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			}
 			m.searchTotal.Add(1)
 			type searchResultJSON struct {
-				URL     string  `json:"url"`
-				Title   string  `json:"title"`
-				Snippet string  `json:"snippet"`
-				VisitTs int64   `json:"visitTs"`
-				Score   float64 `json:"score"`
-				Domain  string  `json:"domain"`
+				URL      string   `json:"url"`
+				Title    string   `json:"title"`
+				Snippet  string   `json:"snippet"`
+				Snippets []string `json:"snippets"`
+				VisitTs  int64    `json:"visitTs"`
+				Score    float64  `json:"score"`
+				Domain   string   `json:"domain"`
+				Tags     []string `json:"tags"`
+				Source   string   `json:"source"`
 			}
 			type searchResponse struct {
 				Results []searchResultJSON `json:"results"`
 				Total   int                `json:"total"`
 			}
-			resp := searchResponse{Results: make([]searchResultJSON, 0, len(results)), Total: len(results)}
-			for _, res := range results {
+			// Drop irrelevant matches: absolute floor + relative floor vs top.
+			// Always keep at least the top hit when there is any match.
+			const absFloor = 0.005
+			const relFloor = 0.30
+			topScore := 0.0
+			if len(results) > 0 {
+				topScore = results[0].Score
+			}
+			resp := searchResponse{Results: make([]searchResultJSON, 0, len(results))}
+			for i, res := range results {
+				if i > 0 {
+					if res.Score < absFloor {
+						continue
+					}
+					if topScore > 0 && res.Score < relFloor*topScore {
+						continue
+					}
+				}
+				snippets := res.Snippets
+				if snippets == nil {
+					snippets = []string{}
+				}
+				tags := res.Tags
+				if tags == nil {
+					tags = []string{}
+				}
+				src := res.Source
+				if src == "" {
+					src = "history"
+				}
 				resp.Results = append(resp.Results, searchResultJSON{
-					URL:     res.URL,
-					Title:   res.Title,
-					Snippet: res.Snippet,
-					VisitTs: res.VisitTs,
-					Score:   res.Score,
-					Domain:  res.Domain,
+					URL:      res.URL,
+					Title:    res.Title,
+					Snippet:  res.Snippet,
+					Snippets: snippets,
+					VisitTs:  res.VisitTs,
+					Score:    res.Score,
+					Domain:   res.Domain,
+					Tags:     tags,
+					Source:   src,
 				})
 			}
+			resp.Total = len(resp.Results)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(resp)
 		})

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -60,8 +61,18 @@ func (e *OpenAIEmbedder) Embed(text string) ([]float32, error) {
 	}
 	defer resp.Body.Close()
 
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read embed response: %w", err)
+	}
+
+	snippet := raw
+	if len(snippet) > 256 {
+		snippet = snippet[:256]
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embed endpoint returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("embed endpoint returned %d: %s", resp.StatusCode, snippet)
 	}
 
 	var result struct {
@@ -69,8 +80,8 @@ func (e *OpenAIEmbedder) Embed(text string) ([]float32, error) {
 			Embedding []float32 `json:"embedding"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode embed response: %w", err)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode embed response: %w — body: %s", err, snippet)
 	}
 	if len(result.Data) == 0 || len(result.Data[0].Embedding) == 0 {
 		return nil, fmt.Errorf("embed response contained empty embedding")

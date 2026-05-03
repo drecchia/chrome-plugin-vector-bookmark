@@ -170,6 +170,47 @@ func TestIngest_TagsAreNormalised(t *testing.T) {
 	}
 }
 
+// TestIngestPrepared_PersistsTags is the regression test for a real production
+// bug: the queue worker calls IngestPrepared (not Ingest), but the prepared
+// path used to ignore req.Tags / req.SetTags entirely, dropping every tag
+// silently. This guards the fix where both paths share persistTags().
+func TestIngestPrepared_PersistsTags(t *testing.T) {
+	s := newTestStore(t)
+	url := "https://example.com/prepared"
+
+	// Build a PreparedIngest manually with one fake-embedded chunk — the queue
+	// worker constructs this exactly the same way after running the embedder.
+	req := IngestRequest{
+		URL: url, Domain: "example.com", Title: "t",
+		Text:    longText(120),
+		VisitTs: nowMs(),
+		Tags:    []string{"work", "ai"},
+		SetTags: true,
+		Source:  "indexed",
+	}
+	p := PreparedIngest{
+		Req: req,
+		Chunks: []PreparedChunk{{
+			Index: 0,
+			Text:  longText(120),
+			Hash:  "fakehash",
+			Vec:   make([]float32, 8),
+		}},
+	}
+	if err := s.IngestPrepared(p); err != nil {
+		t.Fatalf("IngestPrepared: %v", err)
+	}
+	requireTags(t, s, url, []string{"ai", "work"})
+
+	// Re-run with set-mode [ai, read-later] — drops "work", keeps "ai", adds "read-later".
+	req.Tags = []string{"ai", "read-later"}
+	p.Req = req
+	if err := s.IngestPrepared(p); err != nil {
+		t.Fatalf("IngestPrepared (replace): %v", err)
+	}
+	requireTags(t, s, url, []string{"ai", "read-later"})
+}
+
 // ── ListTags / ListPagesByTag ────────────────────────────────────────────────
 
 func TestListTags_CountsPagesPerTag(t *testing.T) {

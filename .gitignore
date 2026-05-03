@@ -22,3 +22,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+k8s/vortus-development/

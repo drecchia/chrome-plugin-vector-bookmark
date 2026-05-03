@@ -56,6 +56,10 @@ type IngestRequest struct {
 	// SetTags=true replaces the page's tag set with Tags exactly (delete + insert).
 	// SetTags=false (default) merges Tags into existing (INSERT OR IGNORE only).
 	SetTags bool
+	// Source labels how the page entered the index. "indexed" = explicit
+	// /ingest from the popup; "history" = passive /visit dwell capture.
+	// Empty defaults to "history" at persistence time.
+	Source string
 }
 
 // TagCount holds a tag and the number of pages that carry it.
@@ -64,14 +68,19 @@ type TagCount struct {
 	Count int    `json:"count"`
 }
 
-// SearchResult holds a single search hit.
+// SearchResult holds a single search hit. One result represents one page;
+// when several chunks of the same page match, their texts are merged into
+// Snippets (top-ranked first) and Snippet keeps the best for backward compat.
 type SearchResult struct {
-	URL     string
-	Title   string
-	Snippet string
-	VisitTs int64
-	Score   float64
-	Domain  string
+	URL      string
+	Title    string
+	Snippet  string
+	Snippets []string
+	VisitTs  int64
+	Score    float64
+	Domain   string
+	Tags     []string
+	Source   string // "indexed" | "history"
 }
 
 // ForgetRequest describes what to delete.
@@ -226,6 +235,10 @@ CREATE TABLE IF NOT EXISTS page_tags (
     PRIMARY KEY (page_id, tag)
 );
 CREATE INDEX IF NOT EXISTS idx_page_tags_tag ON page_tags(tag);`
+	// schemaV8: tag the origin of each page so the UI can distinguish
+	// passive dwell captures ("history") from explicit popup ingests
+	// ("indexed"). Existing rows default to "history".
+	const schemaV8 = `ALTER TABLE pages ADD COLUMN source TEXT NOT NULL DEFAULT 'history';`
 
 	migrations := []struct {
 		version    int
@@ -239,6 +252,7 @@ CREATE INDEX IF NOT EXISTS idx_page_tags_tag ON page_tags(tag);`
 		{5, schemaV5, true}, // column may already be absent on recent fresh DBs
 		{6, schemaV6, false},
 		{7, schemaV7, false},
+		{8, schemaV8, false},
 	}
 
 	for _, m := range migrations {
@@ -289,58 +303,18 @@ func (s *Store) RecordVisit(req VisitRequest) error {
 	return nil
 }
 
-// Ingest chunks and stores a page, embedding each chunk.
-func (s *Store) Ingest(req IngestRequest) error {
-	chunks := chunk.SplitIntoChunks(req.Text)
-	if chunks == nil {
-		return nil // too short
-	}
-
-	urlHash := chunk.Hash(req.URL)
-	now := time.Now().UnixMilli()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Upsert page — set indexed=1 since this is a full ingest with text.
-	res, err := tx.Exec(`
-		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-		ON CONFLICT(url_hash) DO UPDATE SET
-			title=excluded.title,
-			domain=excluded.domain,
-			visit_ts=excluded.visit_ts,
-			dwell_ms=excluded.dwell_ms,
-			model_ver=excluded.model_ver,
-			indexed=1
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), now)
-	if err != nil {
-		return fmt.Errorf("upsert page: %w", err)
-	}
-
-	pageID, err := res.LastInsertId()
-	if err != nil || pageID == 0 {
-		// ON CONFLICT DO UPDATE doesn't return a new LastInsertId in all drivers; fetch it
-		row := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash)
-		if err2 := row.Scan(&pageID); err2 != nil {
-			return fmt.Errorf("get page id: %w", err2)
-		}
-	}
-
-	// Normalize requested tags (dedup, drop empties).
+// persistTags applies tag changes for a page inside the caller's transaction.
+// SetTags=true makes req.Tags the authoritative list (DELETE + INSERT). Otherwise
+// only INSERT OR IGNORE happens (merge mode). Tags are normalized; empty entries
+// are dropped silently.
+func persistTags(tx *sql.Tx, pageID int64, req IngestRequest, now int64) error {
 	wantTags := make(map[string]struct{}, len(req.Tags))
 	for _, t := range req.Tags {
 		if nt := normalizeTag(t); nt != "" {
 			wantTags[nt] = struct{}{}
 		}
 	}
-
 	if req.SetTags {
-		// Set-mode: the requested list becomes the authoritative final list.
-		// Delete tags not in wantTags, then INSERT OR IGNORE the rest.
 		if len(wantTags) == 0 {
 			if _, err := tx.Exec(`DELETE FROM page_tags WHERE page_id = ?`, pageID); err != nil {
 				return fmt.Errorf("clear tags: %w", err)
@@ -362,7 +336,6 @@ func (s *Store) Ingest(req IngestRequest) error {
 			}
 		}
 	}
-
 	for t := range wantTags {
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO page_tags (page_id, tag, created_at) VALUES (?, ?, ?)`,
@@ -370,6 +343,60 @@ func (s *Store) Ingest(req IngestRequest) error {
 		); err != nil {
 			return fmt.Errorf("insert tag %q: %w", t, err)
 		}
+	}
+	return nil
+}
+
+// Ingest chunks and stores a page, embedding each chunk.
+func (s *Store) Ingest(req IngestRequest) error {
+	chunks := chunk.SplitIntoChunks(req.Text)
+	if chunks == nil {
+		return nil // too short
+	}
+
+	urlHash := chunk.Hash(req.URL)
+	now := time.Now().UnixMilli()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	source := req.Source
+	if source == "" {
+		source = "history"
+	}
+	// Upsert page — set indexed=1 since this is a full ingest with text.
+	// Source is upgraded to "indexed" only when the request says so; a
+	// passive history hit must never demote a previous "indexed" mark.
+	res, err := tx.Exec(`
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(url_hash) DO UPDATE SET
+			title=excluded.title,
+			domain=excluded.domain,
+			visit_ts=excluded.visit_ts,
+			dwell_ms=excluded.dwell_ms,
+			model_ver=excluded.model_ver,
+			indexed=1,
+			source=CASE WHEN excluded.source='indexed' THEN 'indexed' ELSE pages.source END
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), source, now)
+	if err != nil {
+		return fmt.Errorf("upsert page: %w", err)
+	}
+
+	pageID, err := res.LastInsertId()
+	if err != nil || pageID == 0 {
+		// ON CONFLICT DO UPDATE doesn't return a new LastInsertId in all drivers; fetch it
+		row := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash)
+		if err2 := row.Scan(&pageID); err2 != nil {
+			return fmt.Errorf("get page id: %w", err2)
+		}
+	}
+
+	if err := persistTags(tx, pageID, req, now); err != nil {
+		return err
 	}
 
 	for _, c := range chunks {
@@ -434,17 +461,22 @@ func (s *Store) IngestPrepared(p PreparedIngest) error {
 	}
 	defer tx.Rollback()
 
+	source := req.Source
+	if source == "" {
+		source = "history"
+	}
 	res, err := tx.Exec(`
-		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+		INSERT INTO pages (url, url_hash, title, domain, visit_ts, dwell_ms, model_ver, indexed, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 		ON CONFLICT(url_hash) DO UPDATE SET
 			title=excluded.title,
 			domain=excluded.domain,
 			visit_ts=excluded.visit_ts,
 			dwell_ms=excluded.dwell_ms,
 			model_ver=excluded.model_ver,
-			indexed=1
-	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), now)
+			indexed=1,
+			source=CASE WHEN excluded.source='indexed' THEN 'indexed' ELSE pages.source END
+	`, req.URL, urlHash, req.Title, req.Domain, req.VisitTs, req.DwellMs, s.embedder.Version(), source, now)
 	if err != nil {
 		return fmt.Errorf("upsert page: %w", err)
 	}
@@ -454,6 +486,10 @@ func (s *Store) IngestPrepared(p PreparedIngest) error {
 		if err2 := row.Scan(&pageID); err2 != nil {
 			return fmt.Errorf("get page id: %w", err2)
 		}
+	}
+
+	if err := persistTags(tx, pageID, req, now); err != nil {
+		return err
 	}
 
 	for _, c := range p.Chunks {
@@ -605,24 +641,27 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
 
-	if len(entries) > limit {
-		entries = entries[:limit]
+	// Keep up to limit*5 chunks so page-level aggregation has enough material;
+	// final cap applies after grouping by page_id.
+	chunkCap := limit * 5
+	if chunkCap < 50 {
+		chunkCap = 50
+	}
+	if len(entries) > chunkCap {
+		entries = entries[:chunkCap]
 	}
 
-	// Step 4: Build results — single JOIN query instead of N+1.
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	scoreByID := make(map[int64]float64, len(entries))
 	ids := make([]any, len(entries))
 	for i, e := range entries {
 		ids[i] = e.id
-		scoreByID[e.id] = e.score
 	}
 	placeholders := strings.Repeat("?,", len(ids))
 	placeholders = placeholders[:len(placeholders)-1]
 	joinQuery := fmt.Sprintf(`
-		SELECT c.id, c.text, p.url, p.title, p.domain, p.visit_ts
+		SELECT c.id, c.page_id, c.text, p.url, p.title, p.domain, p.visit_ts, p.source
 		FROM chunks c JOIN pages p ON c.page_id = p.id
 		WHERE c.id IN (%s)
 	`, placeholders)
@@ -632,25 +671,35 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 	}
 	defer joinRows.Close()
 
-	// Collect into map to preserve RRF order after JOIN.
 	type rowData struct {
+		pageID  int64
 		text    string
 		url     string
 		title   string
 		domain  string
 		visitTs int64
+		source  string
 	}
 	rowMap := make(map[int64]rowData, len(entries))
 	for joinRows.Next() {
 		var id int64
 		var rd rowData
-		if err := joinRows.Scan(&id, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs); err != nil {
+		if err := joinRows.Scan(&id, &rd.pageID, &rd.text, &rd.url, &rd.title, &rd.domain, &rd.visitTs, &rd.source); err != nil {
 			continue
 		}
 		rowMap[id] = rd
 	}
 
-	results := make([]SearchResult, 0, len(entries))
+	// Group chunks by page_id, preserving RRF order within each page.
+	type pageAgg struct {
+		url, title, domain, source string
+		visitTs                    int64
+		bestScore                  float64
+		extras                     int
+		snippets                   []string
+	}
+	pages := make(map[int64]*pageAgg)
+	pageOrder := []int64{}
 	for _, e := range entries {
 		rd, ok := rowMap[e.id]
 		if !ok {
@@ -661,16 +710,85 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 		if len(snippet) > 400 {
 			snippet = snippet[:400]
 		}
+		ag, exists := pages[rd.pageID]
+		if !exists {
+			pages[rd.pageID] = &pageAgg{
+				url:       rd.url,
+				title:     rd.title,
+				domain:    rd.domain,
+				source:    rd.source,
+				visitTs:   rd.visitTs,
+				bestScore: e.score,
+				snippets:  []string{snippet},
+			}
+			pageOrder = append(pageOrder, rd.pageID)
+			continue
+		}
+		// Same page already seen with a higher RRF score — keep best score
+		// plus a small coverage bonus (10% of this chunk's score) per extra
+		// match, capped so it cannot overtake a stronger top-1 page.
+		ag.extras++
+		ag.bestScore += 0.1 * e.score
+		if len(ag.snippets) < 3 {
+			ag.snippets = append(ag.snippets, snippet)
+		}
+	}
+
+	// Sort pages by aggregated score, then truncate to limit.
+	sort.SliceStable(pageOrder, func(i, j int) bool {
+		return pages[pageOrder[i]].bestScore > pages[pageOrder[j]].bestScore
+	})
+	if len(pageOrder) > limit {
+		pageOrder = pageOrder[:limit]
+	}
+
+	// Batch-fetch tags for the surviving pages.
+	tagsByPage := make(map[int64][]string, len(pageOrder))
+	if len(pageOrder) > 0 {
+		pageIDArgs := make([]any, len(pageOrder))
+		for i, pid := range pageOrder {
+			pageIDArgs[i] = pid
+		}
+		tagPH := strings.Repeat("?,", len(pageIDArgs))
+		tagPH = tagPH[:len(tagPH)-1]
+		tagSQL := fmt.Sprintf(`SELECT page_id, tag FROM page_tags WHERE page_id IN (%s) ORDER BY tag ASC`, tagPH)
+		tagRows, err := s.db.Query(tagSQL, pageIDArgs...)
+		if err == nil {
+			for tagRows.Next() {
+				var pid int64
+				var t string
+				if err := tagRows.Scan(&pid, &t); err != nil {
+					continue
+				}
+				tagsByPage[pid] = append(tagsByPage[pid], t)
+			}
+			tagRows.Close()
+		}
+	}
+
+	results := make([]SearchResult, 0, len(pageOrder))
+	for _, pid := range pageOrder {
+		ag := pages[pid]
+		first := ""
+		if len(ag.snippets) > 0 {
+			first = ag.snippets[0]
+		}
+		src := ag.source
+		if src == "" {
+			src = "history"
+		}
 		results = append(results, SearchResult{
-			URL:     rd.url,
-			Title:   rd.title,
-			Snippet: snippet,
-			VisitTs: rd.visitTs,
-			Score:   e.score,
-			Domain:  rd.domain,
+			URL:      ag.url,
+			Title:    ag.title,
+			Snippet:  first,
+			Snippets: ag.snippets,
+			VisitTs:  ag.visitTs,
+			Score:    ag.bestScore,
+			Domain:   ag.domain,
+			Tags:     tagsByPage[pid],
+			Source:   src,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 	return results, nil
 }
 
