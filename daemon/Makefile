@@ -3,11 +3,11 @@
 BIN     := bin/vbmd
 BIN_WIN := bin/vbmd.exe
 
-build:
+build: test
 	@mkdir -p bin
 	go build -o $(BIN) ./cmd/vbmd/
 
-build-windows:
+build-windows: test
 	@mkdir -p bin
 	GOOS=windows GOARCH=amd64 go build -o $(BIN_WIN) ./cmd/vbmd/
 

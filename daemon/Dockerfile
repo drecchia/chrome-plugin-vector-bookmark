@@ -11,6 +11,11 @@ RUN go mod download
 
 COPY . .
 
+# Run unit tests inside the build stage so a broken commit can never produce
+# a published image. Re-runs only when source actually changed (Docker layer
+# cache invalidation on the COPY above).
+RUN go test ./...
+
 # Pure-Go build (modernc.org/sqlite is CGO-free). Static binary so it lands
 # cleanly in distroless/static.
 ENV CGO_ENABLED=0 \
