@@ -1,10 +1,53 @@
 # Vector Bookmark
 
-Semantic recall for everything you've read. Chrome extension + local Go daemon.
+**Your browser already forgot what you read yesterday. This fixes it.**
+
+Native bookmarks are a dead end: a manually-curated tree that nobody maintains. Browser history is worse — a flat, expiring list with no tags, no semantic search, no segmented timeline of what you actually learned over time. And neither one is private: they sync to a vendor cloud you don't control.
+
+Vector Bookmark replaces both with a local-first semantic memory of everything you've read:
+
+- **Passive capture** — pages you actually dwell on (≥10s) get indexed automatically. No manual filing.
+- **Semantic search** — BM25 + embeddings + RRF. Find a page by what it was *about*, not the words you remember from the title.
+- **Auto-tagging** — LLM suggests tags from the page; you can curate. Everything is queryable by tag, by week, by source.
+- **Evolution timeline** — segmented by week/month, see what you were learning *back then*, not a flat infinite scroll that rolls off.
+- **100% local** — Chrome extension + a Go daemon on `127.0.0.1`. SQLite on disk. No telemetry, no cloud, no account. Your reading is yours.
 
 ```
 Extension ──HTTP──▶ vbmd (127.0.0.1:7532) ──▶ SQLite (BM25 + embeddings)
 ```
+
+## Screenshots
+
+### Semantic search across everything you've read
+Hybrid BM25 + vector recall, with confidence scores, tag faceting, and source filtering (indexed pages vs. raw history).
+
+![Search](assets/search.png)
+
+Tighten the recall with a confidence slider, exclude tags, restrict the source — the same query, narrowed to what you want.
+
+![Search with filters](assets/search-filtered.png)
+
+### Tag cloud — your personal knowledge map
+Bigger words = more pages. The shape of what you've been reading, at a glance. Click any tag to drill in.
+
+![Tag cloud](assets/tags-cloud.png)
+
+![Pages by tag](assets/tags-list.png)
+
+### Hot Words — what dominated your week
+Top terms across everything you read this week (or month). The vocabulary of your current obsessions, ranked.
+
+![Hot Words](assets/hot-words.png)
+
+### Timeline — segmented evolution, not a flat history
+Week-by-week, day-by-day. Browser history dies after 90 days and gives you no segmentation. This doesn't.
+
+![Timeline](assets/timeline.png)
+
+### Exclusions — you decide what is never captured
+Block by domain or regex. Internal services, banking, auth pages — they never touch the index.
+
+![Exclusions](assets/exclusions.png)
 
 ## Quick start
 
