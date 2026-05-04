@@ -154,7 +154,7 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 4. **Dedup de página**: `sha1(url)` como `url_hash UNIQUE` — revisitas atualizam a página existente.
 5. **Chunking**: janela 512 tokens, overlap 64, mínimo 40 tokens. Texto < 200 chars descartado no content script.
 6. **Queue com backpressure**: canal cap 256. Se cheio, ingest descartado com log.
-7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 5 default, 20 max. Filtro opcional `?tag=…` restringe candidatos via `page_tags`.
+7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 20 default, 1000 max (clampado, mínimo 1). UI da aba Search expõe input numérico "Max results". Filtro opcional `?tag=…` restringe candidatos via `page_tags`.
 8. **Modos de ingest**: `full_text` (Readability + meta) | `llm_summary` (resumo via LLM substitui o texto antes do chunking) | `manual` (texto fornecido pelo popup) | `meta_only` (apenas título + meta tags). Default = `full_text`. Em todos os modos, meta + título são prefixados ao corpo, exceto `meta_only` que é apenas o bloco de meta.
 9. **Tags em set-mode**: quando o popup envia ingest com `setTags=true`, a lista de tags vira o estado final daquela página (DELETE + INSERT na mesma tx). `setTags=false`/ausente = merge (INSERT OR IGNORE). Tags são normalizadas para `[a-z0-9 \-_]`, max 64 chars.
 

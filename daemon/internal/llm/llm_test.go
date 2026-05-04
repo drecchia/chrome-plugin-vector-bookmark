@@ -199,7 +199,7 @@ func TestSuggestTags_ParsesAndCapsAtMax(t *testing.T) {
 		if !strings.Contains(content, "rust") {
 			t.Errorf("expected existing tag 'rust' in user msg, got %q", content)
 		}
-		// LLM returns 5 tags; client must cap at suggestTagsMax (3).
+		// LLM returns 5 tags; client must cap at suggestTagsMaxDefault (3).
 		return http.StatusOK, `{"tags":["a","b","c","d","e"]}`
 	})
 	defer srv.Close()
@@ -209,8 +209,8 @@ func TestSuggestTags_ParsesAndCapsAtMax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SuggestTags: %v", err)
 	}
-	if len(got) != suggestTagsMax {
-		t.Errorf("expected cap at %d, got %d (%v)", suggestTagsMax, len(got), got)
+	if len(got) != suggestTagsMaxDefault {
+		t.Errorf("expected cap at %d, got %d (%v)", suggestTagsMaxDefault, len(got), got)
 	}
 }
 

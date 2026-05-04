@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -78,7 +79,7 @@ const uiHTML = `<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;color:#111;background:#f9fafb;line-height:1.5}
-.wrap{max-width:680px;margin:0 auto;padding:32px 20px}
+.wrap{max-width:1100px;margin:0 auto;padding:32px 20px}
 header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px}
 h1{font-size:15px;font-weight:600}
 #stat{font-size:12px;color:#9ca3af}
@@ -163,6 +164,60 @@ h1{font-size:15px;font-weight:600}
 .source-badge.indexed{background:#dcfce7;color:#166534}
 .source-badge.history{background:#e0e7ff;color:#3730a3}
 .snippet+.snippet{margin-top:4px;padding-top:4px;border-top:1px dashed #f3f4f6}
+/* pending tag chip on result cards */
+.tag-chip.pending{outline:2px dashed #6366f1;outline-offset:1px}
+/* edit + apply controls per result */
+.edit-btn{font-size:11px;padding:2px 8px;background:none;border:1px solid #e5e7eb;color:#9ca3af;border-radius:4px;cursor:pointer;margin-right:6px;float:right;margin-top:2px}
+.edit-btn:hover{border-color:#6366f1;color:#6366f1}
+.apply-btn{display:inline-block;margin-top:8px;font-size:11px;padding:4px 12px;background:#6366f1;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:500;float:right}
+.apply-btn:hover{background:#4f46e5}
+.apply-row{margin-top:6px;display:flex;justify-content:flex-end}
+/* edit panel inside a result */
+.edit-panel{margin-top:10px;padding:10px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:5px}
+.edit-panel-title{font-size:11px;font-weight:600;color:#374151;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.edit-panel input[type=text]{width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;outline:none;background:#fff}
+.edit-panel input[type=text]:focus{border-color:#6366f1;box-shadow:0 0 0 2px rgba(99,102,241,.12)}
+.edit-actions{display:flex;gap:6px;justify-content:flex-end;margin-top:8px}
+.edit-actions button{font-size:11px;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:500;border:1px solid transparent}
+.edit-save{background:#111;color:#fff}
+.edit-save:hover{background:#374151}
+.edit-cancel{background:#fff;color:#6b7280;border-color:#d1d5db}
+.edit-cancel:hover{border-color:#9ca3af;color:#374151}
+/* search sidebar layout */
+.search-layout{display:flex;gap:24px;align-items:flex-start}
+.search-sidebar{width:240px;flex-shrink:0;position:sticky;top:16px;background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:14px}
+.search-main{flex:1;min-width:0}
+.filter-group{margin-bottom:18px}
+.filter-group:last-of-type{margin-bottom:12px}
+.filter-title{font-size:11px;font-weight:600;color:#374151;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;display:flex;justify-content:space-between;align-items:baseline}
+.filter-title .v{color:#9ca3af;font-weight:500;text-transform:none;letter-spacing:0;font-size:11px}
+.filter-empty{font-size:12px;color:#9ca3af;font-style:italic}
+.filter-chips{display:flex;flex-wrap:wrap;gap:4px}
+.tag-chip{font-size:11px;padding:2px 8px;border-radius:11px;cursor:pointer;border:1px solid transparent;background:#f3f4f6;color:#374151;user-select:none;line-height:1.5}
+.tag-chip:hover{background:#e5e7eb}
+.tag-chip.include{background:#111;color:#fff;border-color:#111}
+.tag-chip.exclude{background:#fff;color:#dc2626;border-color:#dc2626;text-decoration:line-through}
+.tag-chip.exclude::before{content:"−";margin-right:3px}
+.tag-chip .count{margin-left:4px;opacity:.6;font-size:10px}
+input[type=range]#conf-slider{width:100%;accent-color:#111}
+.source-options{display:flex;flex-direction:column;gap:5px}
+.source-options label{font-size:12px;color:#374151;cursor:pointer;display:flex;align-items:center;gap:6px}
+.source-options input{accent-color:#111;cursor:pointer}
+#filter-clear{font-size:11px;padding:5px 10px;background:#fff;border:1px solid #d1d5db;border-radius:4px;color:#6b7280;cursor:pointer;width:100%}
+#filter-clear:hover{border-color:#111;color:#111}
+@media (max-width:900px){.search-layout{flex-direction:column}.search-sidebar{width:100%;position:static}}
+/* tag sidebar list (alphabetical, vertical) */
+.tag-side{display:flex;justify-content:space-between;align-items:center;width:100%;font-size:12px;padding:5px 8px;border:1px solid transparent;background:transparent;color:#374151;cursor:pointer;border-radius:4px;text-align:left;line-height:1.4}
+.tag-side+.tag-side{margin-top:1px}
+.tag-side:hover{background:#f3f4f6}
+.tag-side.active{background:#111;color:#fff}
+.tag-side .count{opacity:.55;font-size:11px;margin-left:8px;flex-shrink:0}
+.tags-list-scroll{max-height:70vh;overflow-y:auto}
+/* word cloud */
+.cloud-hero{font-size:12px;color:#9ca3af;text-align:center;padding:8px 0 4px}
+.tag-cloud{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px 14px;padding:32px 16px;line-height:1.1}
+.cloud-word{font-weight:700;cursor:pointer;display:inline-block;transition:transform .12s,opacity .12s;opacity:.85;letter-spacing:-.01em}
+.cloud-word:hover{transform:scale(1.06);opacity:1}
 </style>
 </head>
 <body>
@@ -182,17 +237,52 @@ h1{font-size:15px;font-weight:600}
   <div id="search-panel" class="panel active">
     <div class="search-row">
       <input id="q" type="search" placeholder="Search your reading history..." autofocus>
-      <select id="tag-filter" style="padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;outline:none;max-width:160px">
-        <option value="">all tags</option>
-      </select>
       <button id="search-btn">Search</button>
     </div>
-    <div id="results"></div>
+    <div class="search-layout">
+      <aside class="search-sidebar">
+        <div class="filter-group">
+          <div class="filter-title">Tags</div>
+          <div id="tag-chips" class="filter-chips">
+            <div class="filter-empty">Run a search to filter by tags</div>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="filter-title">Min confidence <span id="conf-value" class="v">0%</span></div>
+          <input id="conf-slider" type="range" min="0" max="100" value="0" step="5">
+        </div>
+        <div class="filter-group">
+          <div class="filter-title">Max results</div>
+          <input id="limit-input" type="number" min="1" max="1000" value="20" step="1" style="width:100%;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;outline:none;background:#fff;box-sizing:border-box">
+        </div>
+        <div class="filter-group">
+          <div class="filter-title">Source</div>
+          <div class="source-options">
+            <label><input type="radio" name="source" value="" checked>Both</label>
+            <label><input type="radio" name="source" value="indexed">Indexed only</label>
+            <label><input type="radio" name="source" value="history">History only</label>
+          </div>
+        </div>
+        <button id="filter-clear" type="button">Clear filters</button>
+      </aside>
+      <div class="search-main">
+        <div id="results"></div>
+      </div>
+    </div>
   </div>
 
   <div id="tags-panel" class="panel">
-    <div id="tags-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px"></div>
-    <div id="tags-pages"></div>
+    <div class="search-layout">
+      <aside class="search-sidebar">
+        <div class="filter-group" style="margin-bottom:0">
+          <div class="filter-title">Tags <span id="tags-count" class="v"></span></div>
+          <div id="tags-list" class="tags-list-scroll"></div>
+        </div>
+      </aside>
+      <div class="search-main">
+        <div id="tags-pages"></div>
+      </div>
+    </div>
   </div>
 
   <div id="hotwords-panel" class="panel">
@@ -241,44 +331,260 @@ var q=document.getElementById('q'),btn=document.getElementById('search-btn'),res
 fetch('/status').then(function(r){return r.json()}).then(function(d){stat.textContent=d.indexed+' pages indexed'}).catch(function(){})
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function fmt(ts){var d=new Date(ts),diff=Date.now()-ts;if(diff<86400000)return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});if(diff<604800000)return d.toLocaleDateString([],{weekday:'short'});return d.toLocaleDateString([],{month:'short',day:'numeric'})}
-var tagFilter=document.getElementById('tag-filter')
-function search(){
-  var v=q.value.trim();if(!v)return
-  btn.disabled=true;btn.textContent='...'
-  var url='/search?q='+encodeURIComponent(v)+'&limit=10'
-  var t=tagFilter&&tagFilter.value;if(t)url+='&tag='+encodeURIComponent(t)
-  fetch(url).then(function(r){return r.json()}).then(function(data){
-    var list=data.results||[]
-    if(!list.length){res.innerHTML='<div class="empty">No results</div>';return}
-    var top=list[0].score||0
-    res.innerHTML='<div class="count">'+list.length+' result'+(list.length>1?'s':'')+'</div>'+list.map(function(r){
-      var pct=top>0?Math.round((r.score/top)*100):0
-      var snips=(r.snippets&&r.snippets.length?r.snippets:[r.snippet||''])
-        .map(function(s){return '<div class="snippet">'+esc(s)+'</div>'}).join('')
-      var tags=(r.tags||[]).map(function(t){return '<span class="hist-kw">'+esc(t)+'</span>'}).join('')
-      var conf=top>0?'<span class="confidence" title="'+pct+'% relative to top match"><span class="confidence-bar"><span class="confidence-fill" style="width:'+pct+'%"></span></span><span>'+pct+'%</span></span>':''
-      var src=r.source==='indexed'?'indexed':'history'
-      var srcLabel=src==='indexed'?'indexed':'history'
-      var badge='<span class="source-badge '+src+'" title="'+(src==='indexed'?'Manually indexed via the popup':'Captured passively from your browsing history')+'">'+srcLabel+'</span>'
-      return '<div class="result">'+
-        '<button class="forget-btn" data-url="'+esc(r.url)+'">forget</button>'+
-        '<div class="result-meta"><span class="domain">'+esc(r.domain)+'</span><span class="date">'+fmt(r.visitTs)+'</span>'+badge+conf+'</div>'+
-        '<a class="result-title" href="'+esc(r.url)+'" target="_blank">'+esc(r.title||r.url)+'</a>'+
-        snips+
-        (tags?'<div class="hist-kws" style="margin-top:6px">'+tags+'</div>':'')+
-      '</div>'
+// ── search filter state ───────────────────────────────────────────────────────
+// Single source of truth for the sidebar filters. Mutating any of these and
+// calling fireSearch() re-runs the query with the current state.
+var filterState={tags:{},minConf:0,source:''}
+// Per-result tag clicks STAGE here without firing a search. Apply button on a
+// result merges these into filterState and fires the search.
+var pendingTagChanges={}
+// Cache last results so we can repaint after staging changes without re-fetching.
+var lastResults=[],lastTopScore=0
+var knownTagsForQuery={} // tag -> count seen in the most recent unfiltered run
+var tagChips=document.getElementById('tag-chips')
+var confSlider=document.getElementById('conf-slider')
+var confValue=document.getElementById('conf-value')
+var filterClearBtn=document.getElementById('filter-clear')
+var sourceRadios=document.querySelectorAll('input[name="source"]')
+var lastQuery=''
+
+function getMaxResults(){
+  var el=document.getElementById('limit-input')
+  var n=parseInt(el&&el.value,10)
+  if(!isFinite(n)||n<1)n=20
+  if(n>1000)n=1000
+  return n
+}
+function buildSearchURL(query){
+  var url='/search?q='+encodeURIComponent(query)+'&limit='+getMaxResults()
+  Object.keys(filterState.tags).forEach(function(t){
+    var st=filterState.tags[t]
+    if(st==='include')url+='&tag='+encodeURIComponent(t)
+    else if(st==='exclude')url+='&neg_tag='+encodeURIComponent(t)
+  })
+  if(filterState.minConf>0)url+='&min_confidence='+(filterState.minConf/100).toFixed(2)
+  if(filterState.source)url+='&source='+filterState.source
+  return url
+}
+
+function renderTagChips(){
+  var keys=Object.keys(knownTagsForQuery).sort()
+  if(!keys.length){
+    tagChips.innerHTML='<div class="filter-empty">Run a search to filter by tags</div>'
+    return
+  }
+  tagChips.innerHTML=keys.map(function(t){
+    var st=filterState.tags[t]||''
+    var cls='tag-chip'+(st?(' '+st):'')
+    var title=st==='include'?'Click to exclude':st==='exclude'?'Click to clear':'Click to require'
+    return '<span class="'+cls+'" data-tag="'+esc(t)+'" title="'+title+'">'+esc(t)+'<span class="count">'+knownTagsForQuery[t]+'</span></span>'
+  }).join('')
+}
+
+tagChips.addEventListener('click',function(e){
+  var c=e.target.closest('.tag-chip');if(!c)return
+  var tag=c.dataset.tag
+  var st=filterState.tags[tag]
+  // Cycle: neutral → include → exclude → neutral
+  if(!st)filterState.tags[tag]='include'
+  else if(st==='include')filterState.tags[tag]='exclude'
+  else delete filterState.tags[tag]
+  renderTagChips();fireSearch()
+})
+
+var slDebounce=null
+confSlider.addEventListener('input',function(){
+  filterState.minConf=parseInt(confSlider.value,10)||0
+  confValue.textContent=filterState.minConf+'%'
+  if(slDebounce)clearTimeout(slDebounce)
+  slDebounce=setTimeout(fireSearch,200)
+})
+sourceRadios.forEach(function(r){r.addEventListener('change',function(){
+  filterState.source=r.value;fireSearch()
+})})
+var limitInput=document.getElementById('limit-input')
+var limitDebounce=null
+function clampLimitInput(){
+  var n=parseInt(limitInput.value,10)
+  if(!isFinite(n)||n<1)n=20
+  if(n>1000)n=1000
+  limitInput.value=n
+}
+limitInput.addEventListener('input',function(){
+  if(limitDebounce)clearTimeout(limitDebounce)
+  limitDebounce=setTimeout(function(){clampLimitInput();fireSearch()},400)
+})
+limitInput.addEventListener('change',function(){clampLimitInput();fireSearch()})
+filterClearBtn.addEventListener('click',function(){
+  filterState={tags:{},minConf:0,source:''}
+  confSlider.value=0;confValue.textContent='0%'
+  limitInput.value=20
+  document.querySelector('input[name="source"][value=""]').checked=true
+  renderTagChips();fireSearch()
+})
+
+function effectiveTagState(t){
+  if(pendingTagChanges.hasOwnProperty(t))return pendingTagChanges[t]||''
+  return filterState.tags[t]||''
+}
+
+// paint renders results from the cached lastResults without re-fetching.
+// Called after staging tag changes (in-result clicks) so the user sees the
+// pending state without an immediate fetch.
+function paint(){
+  var list=lastResults,top=lastTopScore
+  if(!list||!list.length){res.innerHTML='<div class="empty">No results</div>';return}
+  res.innerHTML='<div class="count">'+list.length+' result'+(list.length>1?'s':'')+'</div>'+list.map(function(r,idx){
+    var pct=top>0?Math.round((r.score/top)*100):0
+    var snips=(r.snippets&&r.snippets.length?r.snippets:[r.snippet||''])
+      .map(function(s){return '<div class="snippet">'+esc(s)+'</div>'}).join('')
+    var resultTags=r.tags||[]
+    var hasPendingForThis=resultTags.some(function(t){return pendingTagChanges.hasOwnProperty(t)})
+    var tagsHTML=resultTags.map(function(t){
+      var st=effectiveTagState(t)
+      var dirty=pendingTagChanges.hasOwnProperty(t)?' pending':''
+      var cls='tag-chip'+(st?(' '+st):'')+dirty
+      var title=dirty?'Pending — click Apply filter to commit':st==='include'?'Click to exclude':st==='exclude'?'Click to clear':'Click to require'
+      return '<span class="'+cls+'" data-tag="'+esc(t)+'" title="'+title+'">'+esc(t)+'</span>'
     }).join('')
+    var conf=top>0?'<span class="confidence" title="'+pct+'% relative to top match"><span class="confidence-bar"><span class="confidence-fill" style="width:'+pct+'%"></span></span><span>'+pct+'%</span></span>':''
+    var src=r.source==='indexed'?'indexed':'history'
+    var srcLabel=src==='indexed'?'indexed':'history'
+    var badge='<span class="source-badge '+src+'" title="'+(src==='indexed'?'Manually indexed via the popup':'Captured passively from your browsing history')+'">'+srcLabel+'</span>'
+    var applyRow=hasPendingForThis?'<div class="apply-row"><button class="apply-btn" type="button">Apply filter</button></div>':''
+    return '<div class="result" data-idx="'+idx+'" data-url="'+esc(r.url)+'">'+
+      '<button class="forget-btn" data-url="'+esc(r.url)+'">forget</button>'+
+      '<button class="edit-btn" type="button" title="Edit tags">edit</button>'+
+      '<div class="result-meta"><span class="domain">'+esc(r.domain)+'</span><span class="date">'+fmt(r.visitTs)+'</span>'+badge+conf+'</div>'+
+      '<a class="result-title" href="'+esc(r.url)+'" target="_blank">'+esc(r.title||r.url)+'</a>'+
+      snips+
+      (tagsHTML?'<div class="hist-kws" style="margin-top:6px">'+tagsHTML+'</div>':'')+
+      applyRow+
+    '</div>'
+  }).join('')
+}
+
+function applyPending(){
+  Object.keys(pendingTagChanges).forEach(function(t){
+    var v=pendingTagChanges[t]
+    if(v)filterState.tags[t]=v
+    else delete filterState.tags[t]
+  })
+  pendingTagChanges={}
+  renderTagChips();fireSearch()
+}
+
+function search(isNewQuery){
+  var v=q.value.trim();if(!v)return
+  // New query: reset filter state so chips reflect this query's tag universe.
+  if(isNewQuery && v!==lastQuery){
+    filterState={tags:{},minConf:0,source:''}
+    pendingTagChanges={}
+    knownTagsForQuery={}
+    confSlider.value=0;confValue.textContent='0%'
+    document.querySelector('input[name="source"][value=""]').checked=true
+  }
+  lastQuery=v
+  btn.disabled=true;btn.textContent='...'
+  fetch(buildSearchURL(v)).then(function(r){return r.json()}).then(function(data){
+    var list=data.results||[]
+    // First unfiltered run for this query: harvest tag universe for the chips.
+    var anyFilterActive=Object.keys(filterState.tags).length>0||filterState.minConf>0||filterState.source
+    if(!anyFilterActive){
+      knownTagsForQuery={}
+      list.forEach(function(r){(r.tags||[]).forEach(function(t){
+        knownTagsForQuery[t]=(knownTagsForQuery[t]||0)+1
+      })})
+      renderTagChips()
+    }
+    lastResults=list;lastTopScore=list.length?(list[0].score||0):0
+    paint()
   }).catch(function(){res.innerHTML='<div class="empty">Search failed</div>'})
   .finally(function(){btn.disabled=false;btn.textContent='Search'})
 }
-btn.addEventListener('click',search)
-q.addEventListener('keydown',function(e){if(e.key==='Enter')search()})
+function fireSearch(){search(false)}
+btn.addEventListener('click',function(){search(true)})
+q.addEventListener('keydown',function(e){if(e.key==='Enter')search(true)})
 res.addEventListener('click',function(e){
-  var b=e.target.closest('.forget-btn');if(!b)return
-  b.textContent='...'
-  fetch('/forget',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'url',value:b.dataset.url})})
-    .then(function(){b.closest('.result').remove()}).catch(function(){b.textContent='err'})
+  var f=e.target.closest('.forget-btn')
+  if(f){
+    if(!confirm('Forget this page? This permanently deletes its chunks, embeddings, and tags. This cannot be undone.'))return
+    f.textContent='...'
+    fetch('/forget',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'url',value:f.dataset.url})})
+      .then(function(){f.closest('.result').remove()}).catch(function(){f.textContent='err'})
+    return
+  }
+  // Apply staged tag changes: merge into filterState and re-fetch.
+  if(e.target.closest('.apply-btn')){applyPending();return}
+  // Edit button: toggle the inline tag editor on this result.
+  var ed=e.target.closest('.edit-btn')
+  if(ed){toggleEditPanel(ed.closest('.result'));return}
+  // Save / Cancel inside the edit panel.
+  if(e.target.closest('.edit-save')){saveEditPanel(e.target.closest('.result'));return}
+  if(e.target.closest('.edit-cancel')){closeEditPanel(e.target.closest('.result'));return}
+  // Per-result tag chip: STAGE the change in pendingTagChanges (does NOT fire
+  // the search). User clicks Apply filter when satisfied with the staging.
+  var c=e.target.closest('.tag-chip[data-tag]')
+  if(c){
+    var tag=c.dataset.tag
+    var cur=effectiveTagState(tag)
+    var nxt=cur===''?'include':cur==='include'?'exclude':''
+    // If the new state matches the live filterState, drop from pending (no-op).
+    if((filterState.tags[tag]||'')===nxt){
+      delete pendingTagChanges[tag]
+    } else {
+      pendingTagChanges[tag]=nxt||null
+    }
+    paint()
+  }
 })
+
+// ── inline edit panel (per-result tag editor) ────────────────────────────────
+function toggleEditPanel(card){
+  if(!card)return
+  var existing=card.querySelector('.edit-panel')
+  if(existing){existing.remove();return}
+  var idx=parseInt(card.dataset.idx,10)
+  var r=lastResults[idx];if(!r)return
+  var initial=(r.tags||[]).join(', ')
+  var html=
+    '<div class="edit-panel">'+
+      '<div class="edit-panel-title">Edit tags</div>'+
+      '<input type="text" class="edit-tags-input" value="'+esc(initial)+'" placeholder="comma-separated tags">'+
+      '<div class="edit-actions">'+
+        '<button type="button" class="edit-cancel">Cancel</button>'+
+        '<button type="button" class="edit-save">Save</button>'+
+      '</div>'+
+    '</div>'
+  card.insertAdjacentHTML('beforeend',html)
+  var inp=card.querySelector('.edit-tags-input');if(inp)inp.focus()
+}
+function closeEditPanel(card){
+  if(!card)return
+  var p=card.querySelector('.edit-panel');if(p)p.remove()
+}
+function saveEditPanel(card){
+  if(!card)return
+  var idx=parseInt(card.dataset.idx,10)
+  var r=lastResults[idx];if(!r)return
+  var inp=card.querySelector('.edit-tags-input');if(!inp)return
+  var saveBtn=card.querySelector('.edit-save');if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Saving…'}
+  var newTags=inp.value.split(',').map(function(s){return s.trim()}).filter(Boolean)
+  fetch('/page/tags',{
+    method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:r.url,tags:newTags})
+  }).then(function(resp){
+    if(!resp.ok)throw new Error('http '+resp.status)
+    return resp.json()
+  }).then(function(d){
+    lastResults[idx].tags=d.tags||[]
+    closeEditPanel(card);paint()
+  }).catch(function(err){
+    if(saveBtn){saveBtn.disabled=false;saveBtn.textContent='Save'}
+    alert('Failed to save tags: '+err.message)
+  })
+}
 
 // ── tabs ──────────────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(function(t){
@@ -540,29 +846,42 @@ document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click'
 
 // ── tags ──────────────────────────────────────────────────────────────────────
 var tagsList=document.getElementById('tags-list'),tagsPages=document.getElementById('tags-pages'),activeTag=null
-function tagsLoadDropdown(){
-  fetch('/tags').then(function(r){return r.json()}).then(function(d){
-    var tags=d.tags||[]
-    tagFilter.innerHTML='<option value="">all tags</option>'+tags.map(function(t){
-      return '<option value="'+esc(t.tag)+'">'+esc(t.tag)+' ('+t.count+')</option>'
-    }).join('')
-  }).catch(function(){})
-}
 function tagsRender(){
   fetch('/tags').then(function(r){return r.json()}).then(function(d){
     var tags=d.tags||[]
+    var tagsCountEl=document.getElementById('tags-count')
+    if(tagsCountEl)tagsCountEl.textContent=tags.length?'('+tags.length+')':''
     if(!tags.length){
-      tagsList.innerHTML='<div class="empty" style="padding:20px 0">No tags yet — open the popup, click <b>Index this site now</b> and fill the <b>Tags</b> field before <b>Confirm</b>.</div>'
-      tagsPages.innerHTML=''
+      tagsList.innerHTML='<div class="filter-empty">No tags yet.</div>'
+      tagsPages.innerHTML='<div class="empty" style="padding:40px 0">No tags yet — open the popup, click <b>Index this site now</b> and fill the <b>Tags</b> field before <b>Confirm</b>.</div>'
       return
     }
-    tagsList.innerHTML=tags.map(function(t){
+    var sorted=tags.slice().sort(function(a,b){return a.tag.localeCompare(b.tag)})
+    tagsList.innerHTML=sorted.map(function(t){
       var on=t.tag===activeTag
-      return '<button class="tag-pill" data-tag="'+esc(t.tag)+'" style="font-size:12px;padding:5px 10px;border-radius:14px;cursor:pointer;border:1px solid '+(on?'#111':'#e5e7eb')+';background:'+(on?'#111':'#fff')+';color:'+(on?'#fff':'#374151')+'">'+esc(t.tag)+' <span style="opacity:.6">'+t.count+'</span></button>'
+      return '<button class="tag-side'+(on?' active':'')+'" data-tag="'+esc(t.tag)+'">'+
+        '<span>'+esc(t.tag)+'</span><span class="count">'+t.count+'</span></button>'
     }).join('')
     if(activeTag)tagsLoadPages(activeTag)
-    else tagsPages.innerHTML='<div class="empty" style="padding:20px 0">Select a tag to list pages</div>'
-  }).catch(function(){tagsList.innerHTML='<div class="empty">Failed to load tags</div>'})
+    else renderTagCloud(tags)
+  }).catch(function(){tagsList.innerHTML='<div class="filter-empty">Failed to load tags</div>'})
+}
+
+// renderTagCloud shows a font-size-weighted cloud of all tags as the default
+// view of the Tags tab when no tag is selected. Click on a word selects it.
+function renderTagCloud(tags){
+  var counts=tags.map(function(t){return t.count})
+  var max=Math.max.apply(null,counts),min=Math.min.apply(null,counts)
+  // Shuffle for organic placement.
+  var arr=tags.slice().sort(function(){return Math.random()-0.5})
+  var palette=['#ef4444','#f59e0b','#10b981','#3b82f6','#8b5cf6','#ec4899','#6366f1','#14b8a6','#f97316','#0ea5e9']
+  var html=arr.map(function(t,i){
+    var norm=max>min?(t.count-min)/(max-min):0.5
+    var size=14+Math.round(norm*42) // 14px → 56px
+    var color=palette[i%palette.length]
+    return '<span class="cloud-word" data-tag="'+esc(t.tag)+'" title="'+esc(t.tag)+' — '+t.count+' page'+(t.count>1?'s':'')+'" style="font-size:'+size+'px;color:'+color+'">'+esc(t.tag)+'</span>'
+  }).join('')
+  tagsPages.innerHTML='<div class="cloud-hero">Click a tag to list its pages — bigger words = more pages</div><div class="tag-cloud">'+html+'</div>'
 }
 function tagsLoadPages(t){
   tagsPages.innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
@@ -583,15 +902,19 @@ function tagsLoadPages(t){
   }).catch(function(){tagsPages.innerHTML='<div class="empty">Failed to load</div>'})
 }
 tagsList.addEventListener('click',function(e){
-  var b=e.target.closest('.tag-pill');if(!b)return
+  var b=e.target.closest('.tag-side');if(!b)return
   activeTag=(activeTag===b.dataset.tag)?null:b.dataset.tag
+  tagsRender()
+})
+// Word cloud click: same toggle behavior as the sidebar.
+tagsPages.addEventListener('click',function(e){
+  var b=e.target.closest('.cloud-word');if(!b)return
+  activeTag=b.dataset.tag
   tagsRender()
 })
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
   if(t.dataset.panel==='tags-panel')tagsRender()
-  if(t.dataset.panel==='search-panel')tagsLoadDropdown()
 })})
-tagsLoadDropdown()
 </script>
 </body>
 </html>`
@@ -841,23 +1164,38 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 		})
 
 		r.Get("/search", func(w http.ResponseWriter, req *http.Request) {
-			query := req.URL.Query().Get("q")
+			q := req.URL.Query()
+			query := q.Get("q")
 			if query == "" {
 				http.Error(w, `{"error":"q required"}`, http.StatusBadRequest)
 				return
 			}
-			limitStr := req.URL.Query().Get("limit")
-			limit := 5
-			if limitStr != "" {
-				if n, err := strconv.Atoi(limitStr); err == nil {
+			limit := 20
+			if v := q.Get("limit"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
 					limit = n
 				}
 			}
-			if limit > 20 {
-				limit = 20
+			if limit < 1 {
+				limit = 1
 			}
-			tag := req.URL.Query().Get("tag")
-			results, err := s.Search(query, limit, tag)
+			if limit > 1000 {
+				limit = 1000
+			}
+			minConf := 0.0
+			if v := q.Get("min_confidence"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+					minConf = f
+				}
+			}
+			source := q.Get("source")
+			results, err := s.Search(query, store.SearchOpts{
+				Limit:         limit,
+				Tags:          q["tag"],
+				NegTags:       q["neg_tag"],
+				MinConfidence: minConf,
+				Source:        source,
+			})
 			if err != nil {
 				http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
 				return
@@ -878,23 +1216,13 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Results []searchResultJSON `json:"results"`
 				Total   int                `json:"total"`
 			}
-			// Drop irrelevant matches: absolute floor + relative floor vs top.
-			// Always keep at least the top hit when there is any match.
+			// Hard absolute sanity floor. The relative floor is now driven by
+			// SearchOpts.MinConfidence (set by the UI sidebar slider).
 			const absFloor = 0.005
-			const relFloor = 0.30
-			topScore := 0.0
-			if len(results) > 0 {
-				topScore = results[0].Score
-			}
 			resp := searchResponse{Results: make([]searchResultJSON, 0, len(results))}
 			for i, res := range results {
-				if i > 0 {
-					if res.Score < absFloor {
-						continue
-					}
-					if topScore > 0 && res.Score < relFloor*topScore {
-						continue
-					}
+				if i > 0 && res.Score < absFloor {
+					continue
 				}
 				snippets := res.Snippets
 				if snippets == nil {
@@ -986,6 +1314,40 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Indexed bool     `json:"indexed"`
 				Tags    []string `json:"tags"`
 			}{Exists: exists, Indexed: indexed, Tags: tags})
+		})
+
+		// PUT /page/tags — replace the tag set of an indexed page (set-mode).
+		// Body: {url, tags}. Returns the final normalized tag list. 404 if the
+		// page is not in the index.
+		r.Put("/page/tags", func(w http.ResponseWriter, req *http.Request) {
+			var body struct {
+				URL  string   `json:"url"`
+				Tags []string `json:"tags"`
+			}
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			if strings.TrimSpace(body.URL) == "" {
+				http.Error(w, `{"error":"url required"}`, http.StatusBadRequest)
+				return
+			}
+			tags, err := s.UpdatePageTags(body.URL, body.Tags)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					http.Error(w, `{"error":"page not found"}`, http.StatusNotFound)
+					return
+				}
+				slog.Warn("update page tags failed", "url", body.URL, "err", err)
+				http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+				return
+			}
+			if tags == nil {
+				tags = []string{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Tags []string `json:"tags"`
+			}{Tags: tags})
 		})
 
 		// CR-010: user-managed domain blacklist endpoints.
@@ -1321,8 +1683,9 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 		})
 
 		// POST /tags/suggest — runs the LLM over the supplied page context and
-		// returns up to 3 tags. Reuses the same provider as the embedder/llm
-		// summary path. Returns 503 when no LLM is configured.
+		// returns up to VBM_LLM_SUGGEST_TAGS_MAX tags (default 3, clamped 1-25).
+		// Reuses the same provider as the embedder/llm summary path. Returns
+		// 503 when no LLM is configured.
 		r.Post("/tags/suggest", func(w http.ResponseWriter, req *http.Request) {
 			var body struct {
 				URL   string `json:"url"`
@@ -1355,9 +1718,11 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			}
 
 			// Normalize via the same rules used at ingest, drop empties + dedup
-			// preserving order. Cap at 3.
+			// preserving order. Cap at the configured SuggestTagsMax so the
+			// HTTP layer respects VBM_LLM_SUGGEST_TAGS_MAX (was hardcoded 3).
+			tagCap := llmClient.SuggestTagsMax()
 			seen := make(map[string]struct{}, len(raw))
-			out := make([]string, 0, 3)
+			out := make([]string, 0, tagCap)
 			for _, t := range raw {
 				nt := store.NormalizeTag(t)
 				if nt == "" {
@@ -1368,7 +1733,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				}
 				seen[nt] = struct{}{}
 				out = append(out, nt)
-				if len(out) >= 3 {
+				if len(out) >= tagCap {
 					break
 				}
 			}

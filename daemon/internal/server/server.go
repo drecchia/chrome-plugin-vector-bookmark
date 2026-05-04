@@ -43,6 +43,7 @@ var envSpecs = []envSpec{
 	{"VBM_LLM_MODEL", "default: gpt-4o-mini"},
 	{"VBM_LLM_PROMPT_SUMMARIZE_FILE", "default summarize prompt embedded"},
 	{"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", "default suggest-tags prompt embedded"},
+	{"VBM_LLM_SUGGEST_TAGS_MAX", "default: 3 (clamped to 1-25)"},
 	{"VBM_TTL_DAYS", "retention disabled"},
 	{"VBM_CORS_ORIGIN", ""},
 }

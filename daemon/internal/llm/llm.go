@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,8 +26,12 @@ const maxInputChars = 32_000
 // about the topic, not every detail. 8k chars is enough to capture the gist.
 const suggestTagsMaxChars = 8_000
 
-// suggestTagsMax is the hard upper bound on tags returned by SuggestTags.
-const suggestTagsMax = 3
+// suggestTagsMaxDefault is the fallback upper bound on tags returned by
+// SuggestTags when VBM_LLM_SUGGEST_TAGS_MAX is unset/invalid. Allowed range
+// is 1–10; values outside are clamped at startup.
+const suggestTagsMaxDefault = 3
+const suggestTagsMaxFloor = 1
+const suggestTagsMaxCeil = 25
 
 // maxPromptFileBytes caps the size of an external prompt markdown file.
 // Anything bigger almost certainly isn't a prompt.
@@ -38,12 +43,15 @@ const defaultSummarizePrompt = "Summarize the following web page content for ret
 	"Target 200-400 words. Preserve technical terms, names, dates, key claims, and any code or commands mentioned. " +
 	"Output plain prose with no headers, no bullet lists, and no markdown."
 
-// defaultSuggestTagsPrompt is the system message for the SuggestTags call.
+// defaultSuggestTagsPromptTemplate is the system message for the SuggestTags
+// call. %d is replaced with the configured upper bound at client construction.
 // The user message is dynamically built with the existing taxonomy + title +
 // content; only this fixed system prompt is externalisable.
-const defaultSuggestTagsPrompt = "You generate tags for retrieval and curation of saved web pages. " +
-	"Output between 1 and 3 short tags (1-2 words each, lowercase, kebab-case, " +
-	"no leading '#'). " +
+const defaultSuggestTagsPromptTemplate = "You generate tags for retrieval and curation of saved web pages. " +
+	"Output up to %d short tags (1-2 words each, lowercase, kebab-case, no leading '#'). " +
+	"Prefer covering all relevant topics, themes, technologies, entities and use-cases " +
+	"present in the page rather than being terse — return fewer tags only when the page " +
+	"is genuinely narrow in scope. " +
 	"Reuse from the existing tag list when applicable; otherwise create new tags " +
 	"that match the same style. " +
 	"Output STRICT JSON only, exactly in this shape: {\"tags\":[\"tag-one\",\"tag-two\"]}. " +
@@ -88,6 +96,7 @@ type Client struct {
 	http              *http.Client
 	summarizePrompt   string
 	suggestTagsPrompt string
+	suggestTagsMax    int
 }
 
 // New builds a client. embedURL is the embeddings URL (e.g.
@@ -102,6 +111,8 @@ func New(embedURL, model, apiKey string) (*Client, error) {
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
+	maxTags := resolveSuggestTagsMax()
+	defaultPrompt := fmt.Sprintf(defaultSuggestTagsPromptTemplate, maxTags)
 	return &Client{
 		url:    chatURL,
 		model:  model,
@@ -111,9 +122,46 @@ func New(embedURL, model, apiKey string) (*Client, error) {
 			"VBM_LLM_PROMPT_SUMMARIZE_FILE", defaultSummarizePrompt,
 		),
 		suggestTagsPrompt: loadPromptOrDefault(
-			"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", defaultSuggestTagsPrompt,
+			"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", defaultPrompt,
 		),
+		suggestTagsMax: maxTags,
 	}, nil
+}
+
+// SuggestTagsMax returns the configured upper bound on tags from SuggestTags.
+// Exposed so HTTP handlers can size buffers / apply the same cap consistently.
+func (c *Client) SuggestTagsMax() int {
+	if c == nil || c.suggestTagsMax <= 0 {
+		return suggestTagsMaxDefault
+	}
+	return c.suggestTagsMax
+}
+
+// resolveSuggestTagsMax reads VBM_LLM_SUGGEST_TAGS_MAX, parses it as an int,
+// clamps to [suggestTagsMaxFloor, suggestTagsMaxCeil], and falls back to the
+// default on parse error or when unset.
+func resolveSuggestTagsMax() int {
+	raw := strings.TrimSpace(os.Getenv("VBM_LLM_SUGGEST_TAGS_MAX"))
+	if raw == "" {
+		return suggestTagsMaxDefault
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		slog.Warn("VBM_LLM_SUGGEST_TAGS_MAX not a number, using default",
+			"value", raw, "default", suggestTagsMaxDefault)
+		return suggestTagsMaxDefault
+	}
+	if n < suggestTagsMaxFloor {
+		slog.Warn("VBM_LLM_SUGGEST_TAGS_MAX below floor, clamping",
+			"value", n, "floor", suggestTagsMaxFloor)
+		return suggestTagsMaxFloor
+	}
+	if n > suggestTagsMaxCeil {
+		slog.Warn("VBM_LLM_SUGGEST_TAGS_MAX above ceil, clamping",
+			"value", n, "ceil", suggestTagsMaxCeil)
+		return suggestTagsMaxCeil
+	}
+	return n
 }
 
 func deriveChatURL(embedURL string) string {
@@ -279,8 +327,8 @@ func (c *Client) SuggestTags(
 		if err != nil {
 			return nil, fmt.Errorf("parse tags: %w", err)
 		}
-		if len(tags) > suggestTagsMax {
-			tags = tags[:suggestTagsMax]
+		if c.suggestTagsMax > 0 && len(tags) > c.suggestTagsMax {
+			tags = tags[:c.suggestTagsMax]
 		}
 		return tags, nil
 	}

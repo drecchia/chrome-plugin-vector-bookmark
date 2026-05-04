@@ -49,6 +49,7 @@ ENV VBM_PORT=7532 \
 #   VBM_LLM_MODEL=gpt-4o-mini
 #   VBM_LLM_PROMPT_SUMMARIZE_FILE=/path/to/summarize.md
 #   VBM_LLM_PROMPT_SUGGEST_TAGS_FILE=/path/to/tags.md
+#   VBM_LLM_SUGGEST_TAGS_MAX=3   # cap on /tags/suggest output (1-10)
 
 VOLUME ["/data"]
 EXPOSE 7532

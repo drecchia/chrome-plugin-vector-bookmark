@@ -526,16 +526,34 @@ type chunkRow struct {
 	pageID int64
 }
 
-// Search performs hybrid BM25 + cosine RRF search. If tag is non-empty,
-// candidates are restricted to pages carrying that tag.
-func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, error) {
+// SearchOpts collects optional filters for Search.
+type SearchOpts struct {
+	Limit         int      // capped server-side (default 5, max 20)
+	Tags          []string // include AND: page must carry every tag
+	NegTags       []string // exclude OR: page is dropped if it carries any of these
+	MinConfidence float64  // [0,1] — keep only results with score/topScore >= this
+	Source        string   // "indexed" | "history" | "" (= both)
+}
+
+// Search performs hybrid BM25 + cosine RRF search with the filters from opts.
+func (s *Store) Search(query string, opts SearchOpts) ([]SearchResult, error) {
+	limit := opts.Limit
 	if limit <= 0 {
 		limit = 5
 	}
 	if limit > 20 {
 		limit = 20
 	}
-	tag = normalizeTag(tag)
+	// Normalize tag filters.
+	tags := normalizeTagSlice(opts.Tags)
+	negTags := normalizeTagSlice(opts.NegTags)
+	source := strings.TrimSpace(opts.Source)
+	if source != "indexed" && source != "history" {
+		source = ""
+	}
+
+	// Build a reusable page-id WHERE fragment for both BM25 and dense paths.
+	pageFilterSQL, pageFilterArgs := buildPageFilter(tags, negTags, source)
 
 	// Step 1: BM25 via FTS5
 	bm25Chunks := []chunkRow{}
@@ -547,9 +565,9 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 		JOIN chunks c ON c.id = chunks_fts.rowid
 		WHERE chunks_fts MATCH ?`
 	bm25Args := []any{query}
-	if tag != "" {
-		bm25SQL += ` AND c.page_id IN (SELECT page_id FROM page_tags WHERE tag = ?)`
-		bm25Args = append(bm25Args, tag)
+	if pageFilterSQL != "" {
+		bm25SQL += " AND " + pageFilterSQL
+		bm25Args = append(bm25Args, pageFilterArgs...)
 	}
 	bm25SQL += `
 		ORDER BY bm25_score
@@ -600,9 +618,9 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 
 		denseSQL := `SELECT id, text, page_id, embedding FROM chunks`
 		var denseArgs []any
-		if tag != "" {
-			denseSQL += ` WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag = ?)`
-			denseArgs = append(denseArgs, tag)
+		if pageFilterSQL != "" {
+			denseSQL += " WHERE " + strings.ReplaceAll(pageFilterSQL, "c.page_id", "page_id")
+			denseArgs = append(denseArgs, pageFilterArgs...)
 		}
 		allRows, err := s.db.Query(denseSQL, denseArgs...)
 		if err != nil {
@@ -796,6 +814,21 @@ func (s *Store) Search(query string, limit int, tag string) ([]SearchResult, err
 			Tags:     tagsByPage[pid],
 			Source:   src,
 		})
+	}
+
+	// Apply user-controlled relative confidence cutoff. Top result is always
+	// kept; the rest are dropped when score/topScore < opts.MinConfidence.
+	if opts.MinConfidence > 0 && len(results) > 1 {
+		top := results[0].Score
+		if top > 0 {
+			kept := results[:1]
+			for _, r := range results[1:] {
+				if r.Score/top >= opts.MinConfidence {
+					kept = append(kept, r)
+				}
+			}
+			results = kept
+		}
 	}
 	return results, nil
 }
@@ -1171,6 +1204,66 @@ func (s *Store) Export() ([]ExportPage, error) {
 // server) use this so suggested tags match ingest semantics exactly.
 func NormalizeTag(tag string) string { return normalizeTag(tag) }
 
+// normalizeTagSlice runs every entry through normalizeTag, drops empties,
+// and dedupes (preserving order). Used by Search filters.
+func normalizeTagSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, t := range in {
+		nt := normalizeTag(t)
+		if nt == "" {
+			continue
+		}
+		if _, ok := seen[nt]; ok {
+			continue
+		}
+		seen[nt] = struct{}{}
+		out = append(out, nt)
+	}
+	return out
+}
+
+// buildPageFilter returns an SQL fragment (without leading AND/WHERE) and the
+// args that filter chunks/pages by tag inclusion (AND), tag exclusion (NOT IN),
+// and source. Returns ("", nil) when no filter is requested. The fragment uses
+// `c.page_id` so callers can splice into BM25 (chunk-joined) or dense (chunks)
+// queries via a simple ReplaceAll if needed.
+func buildPageFilter(tags, negTags []string, source string) (string, []any) {
+	clauses := []string{}
+	args := []any{}
+	if len(tags) > 0 {
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",")
+		clauses = append(clauses, fmt.Sprintf(
+			`c.page_id IN (SELECT page_id FROM page_tags WHERE tag IN (%s) GROUP BY page_id HAVING COUNT(DISTINCT tag) = %d)`,
+			ph, len(tags),
+		))
+		for _, t := range tags {
+			args = append(args, t)
+		}
+	}
+	if len(negTags) > 0 {
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(negTags)), ",")
+		clauses = append(clauses, fmt.Sprintf(
+			`c.page_id NOT IN (SELECT page_id FROM page_tags WHERE tag IN (%s))`,
+			ph,
+		))
+		for _, t := range negTags {
+			args = append(args, t)
+		}
+	}
+	if source != "" {
+		clauses = append(clauses, `c.page_id IN (SELECT id FROM pages WHERE source = ?)`)
+		args = append(args, source)
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
 // normalizeTag lowercases, trims and validates a tag.
 // Returns "" if the tag is empty or contains only invalid characters.
 // Allowed: a-z, 0-9, '-', '_', spaces. Max length 64.
@@ -1190,6 +1283,34 @@ func normalizeTag(tag string) string {
 		}
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// UpdatePageTags replaces the tag set of the page identified by URL with the
+// supplied list (set-mode: DELETE existing not in new + INSERT OR IGNORE new).
+// Returns sql.ErrNoRows when the page is not in the index. Returns the final
+// (normalized, sorted) tags on success.
+func (s *Store) UpdatePageTags(rawURL string, tags []string) ([]string, error) {
+	urlHash := chunk.Hash(rawURL)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	var pageID int64
+	if err := tx.QueryRow(`SELECT id FROM pages WHERE url_hash = ?`, urlHash).Scan(&pageID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, sql.ErrNoRows
+		}
+		return nil, fmt.Errorf("lookup page: %w", err)
+	}
+	now := time.Now().UnixMilli()
+	if err := persistTags(tx, pageID, IngestRequest{Tags: tags, SetTags: true}, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return s.GetPageTags(rawURL)
 }
 
 // GetPageTags returns the tags currently assigned to the page identified by URL.

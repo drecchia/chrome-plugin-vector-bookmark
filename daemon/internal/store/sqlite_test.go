@@ -322,7 +322,7 @@ func TestSearch_BM25FindsIngestedDoc(t *testing.T) {
 			longText(80), // pad to clear MinTokens
 		VisitTs: nowMs(),
 	})
-	results, err := s.Search("machine learning", 5, "")
+	results, err := s.Search("machine learning", SearchOpts{Limit: 5})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSearch_TagFilterRestrictsCandidates(t *testing.T) {
 		URL: "https://y/", Domain: "y", Title: "y", Text: commonText,
 		VisitTs: nowMs(), Tags: []string{"drop"}, SetTags: true,
 	})
-	results, err := s.Search("common keyword", 5, "keep")
+	results, err := s.Search("common keyword", SearchOpts{Limit: 5, Tags: []string{"keep"}})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
