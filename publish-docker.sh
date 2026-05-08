@@ -19,6 +19,7 @@
 #                     changes. Off by default — uncommitted state usually
 #                     means the image is not reproducible.
 #   SKIP_LATEST=1     Don't also tag/push :latest.
+#   SKIP_LOGIN=1      Skip the login step entirely (assume creds already present).
 #
 # Exits non-zero on any failure (set -euo pipefail). Tests run inside the
 # build via the Dockerfile, so a failing test fails the publish.
@@ -53,16 +54,33 @@ fi
 REMOTE="docker.io/${DOCKERHUB_USER}/${IMAGE_NAME}"
 LOCAL="${IMAGE_NAME}:${TAG}"
 
-echo "==> Logging in to Docker Hub as ${DOCKERHUB_USER}"
-if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
-    echo "${DOCKERHUB_TOKEN}" \
-        | docker login docker.io --username "${DOCKERHUB_USER}" --password-stdin
-else
-    docker login docker.io --username "${DOCKERHUB_USER}"
-fi
+# Detect existing login: docker stores creds in ~/.docker/config.json under
+# either "https://index.docker.io/v1/" or "docker.io". `docker info` also
+# echoes "Username: <user>" when a session is active.
+already_logged_in() {
+    if docker info 2>/dev/null | grep -q "^ Username: ${DOCKERHUB_USER}$"; then
+        return 0
+    fi
+    local cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+    [[ -f "$cfg" ]] || return 1
+    grep -qE '"(https://index\.docker\.io/v1/|docker\.io)"[[:space:]]*:' "$cfg"
+}
 
-# Logout on exit so credentials don't linger on shared CI machines.
-trap 'docker logout docker.io >/dev/null 2>&1 || true' EXIT
+if [[ "${SKIP_LOGIN:-0}" == "1" ]]; then
+    echo "==> SKIP_LOGIN=1, skipping docker login"
+elif already_logged_in; then
+    echo "==> Already logged in to Docker Hub, skipping login"
+else
+    echo "==> Logging in to Docker Hub as ${DOCKERHUB_USER}"
+    if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
+        echo "${DOCKERHUB_TOKEN}" \
+            | docker login docker.io --username "${DOCKERHUB_USER}" --password-stdin
+    else
+        docker login docker.io --username "${DOCKERHUB_USER}"
+    fi
+    # Only logout if WE logged in, so we don't kill a pre-existing session.
+    trap 'docker logout docker.io >/dev/null 2>&1 || true' EXIT
+fi
 
 echo "==> Building ${LOCAL} (tests run inside build stage)"
 docker build -t "${LOCAL}" daemon/
