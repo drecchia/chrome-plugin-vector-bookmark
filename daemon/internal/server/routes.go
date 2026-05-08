@@ -145,7 +145,9 @@ h1{font-size:15px;font-weight:600}
 .kw-page-title:hover{color:#6366f1}
 /* history timeline */
 .hist-chart{margin-bottom:18px;overflow:hidden;border-radius:4px}
+.hist-chart svg rect{cursor:pointer}
 .hist-day-label{display:flex;justify-content:space-between;font-size:10px;color:#9ca3af;margin-top:4px;padding:0 1px}
+.hist-selected-day{font-size:13px;font-weight:600;color:#111;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #f3f4f6}
 .hist-group{margin-bottom:16px}
 .hist-date{font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid #f3f4f6}
 .hist-page{padding:8px 0;border-bottom:1px solid #f9fafb}
@@ -710,6 +712,8 @@ document.getElementById('tl-month').addEventListener('click',function(){
 })
 // ── history timeline ──────────────────────────────────────────────────────────
 var htMode='week', htAnchor=tlWeekStart(new Date())
+var htSelectedDay=null  // 'YYYY-MM-DD' (UTC) — the day whose pages are listed
+var htDailyCache={}     // last fetched daily counts (for re-render without refetch)
 function htPeriod(){
   var from,to
   if(htMode==='week'){from=new Date(htAnchor);to=new Date(htAnchor);to.setDate(to.getDate()+7)}
@@ -723,65 +727,109 @@ function htLabel(){
   }
   return htAnchor.toLocaleDateString([],{month:'long',year:'numeric'})
 }
-function htBuildChart(daily,fromMs,toMs){
+// Build the list of UTC YYYY-MM-DD day keys covering [fromMs, toMs).
+function htDaysInPeriod(fromMs,toMs){
   var days=[],d=new Date(fromMs)
   while(d.getTime()<toMs){days.push(new Date(d));d.setDate(d.getDate()+1)}
   if(htMode==='month'&&days.length>31)days=days.slice(0,31)
+  return days
+}
+function htDayKey(d){return d.toISOString().slice(0,10)}
+function htTodayKey(){return new Date().toISOString().slice(0,10)}
+// Pick a sensible default day for the current period:
+//   today if it falls in the period; else last day with traffic;
+//   else the last day of the period.
+function htClampSelectedDay(daily,fromMs,toMs){
+  var days=htDaysInPeriod(fromMs,toMs)
+  if(!days.length)return null
+  var todayK=htTodayKey()
+  for(var i=0;i<days.length;i++)if(htDayKey(days[i])===todayK)return todayK
+  for(var j=days.length-1;j>=0;j--){var k=htDayKey(days[j]);if((daily[k]||0)>0)return k}
+  return htDayKey(days[days.length-1])
+}
+function htBuildChart(daily,fromMs,toMs){
+  var days=htDaysInPeriod(fromMs,toMs)
   var maxVal=0
   days.forEach(function(day){
-    var k=day.toISOString().slice(0,10)
+    var k=htDayKey(day)
     if((daily[k]||0)>maxVal)maxVal=daily[k]||0
   })
-  if(maxVal===0)return''
   var W=640,H=56,n=days.length,bw=Math.floor((W-n)/(n||1)),gap=1
   var bars=days.map(function(day,i){
-    var k=day.toISOString().slice(0,10),v=daily[k]||0
-    var h=maxVal>0?Math.max(2,Math.round(v/maxVal*(H-4))):0
+    var k=htDayKey(day),v=daily[k]||0
+    var h=maxVal>0?Math.max(2,Math.round(v/maxVal*(H-4))):2
     var x=i*(bw+gap),y=H-h
-    return'<rect x="'+x+'" y="'+y+'" width="'+bw+'" height="'+h+'" rx="1" fill="'+(v>0?'#6366f1':'#e5e7eb')+'"><title>'+k+': '+v+' page'+(v!==1?'s':'')+'</title></rect>'
+    var fill=k===htSelectedDay?'#4338ca':(v>0?'#6366f1':'#e5e7eb')
+    return'<rect data-day="'+k+'" x="'+x+'" y="'+y+'" width="'+bw+'" height="'+h+'" rx="1" fill="'+fill+'"><title>'+k+': '+v+' page'+(v!==1?'s':'')+'</title></rect>'
   }).join('')
   var firstLabel=days[0].toLocaleDateString([],{month:'short',day:'numeric'})
   var lastLabel=days[days.length-1].toLocaleDateString([],{month:'short',day:'numeric'})
   return'<div class="hist-chart"><svg viewBox="0 0 '+W+' '+H+'" width="100%" height="'+H+'" xmlns="http://www.w3.org/2000/svg">'+bars+'</svg>'+
     '<div class="hist-day-label"><span>'+esc(firstLabel)+'</span><span>'+esc(lastLabel)+'</span></div></div>'
 }
-function htRender(){
+// Bounds of a UTC YYYY-MM-DD day, in unix ms.
+function htDayBounds(dayKey){
+  var parts=dayKey.split('-')
+  var from=Date.UTC(+parts[0],+parts[1]-1,+parts[2])
+  return{from:from,to:from+86400000}
+}
+function htRenderChart(){
   var p=htPeriod()
-  document.getElementById('ht-label').textContent=htLabel()
-  document.getElementById('ht-results').innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
-  document.getElementById('ht-chart').innerHTML=''
-  fetch('/history?from='+p.from+'&to='+p.to+'&limit=100')
+  document.getElementById('ht-chart').innerHTML=htBuildChart(htDailyCache,p.from,p.to)
+}
+function htRenderListForSelectedDay(){
+  var resEl=document.getElementById('ht-results')
+  if(!htSelectedDay){resEl.innerHTML='<div class="empty">No day selected</div>';return}
+  resEl.innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
+  var b=htDayBounds(htSelectedDay)
+  var headerD=new Date(b.from)
+  // toLocaleDateString in UTC keeps the label aligned with the UTC day key.
+  var headerLabel=headerD.toLocaleDateString([],{weekday:'long',year:'numeric',month:'long',day:'numeric',timeZone:'UTC'})
+  fetch('/history?from='+b.from+'&to='+b.to+'&limit=500')
     .then(function(r){return r.json()})
     .then(function(d){
       var pages=d.pages||[]
-      document.getElementById('ht-chart').innerHTML=htBuildChart(d.daily||{},p.from,p.to)
-      if(!pages.length){
-        document.getElementById('ht-results').innerHTML='<div class="empty">No pages indexed in this period</div>'
-        return
-      }
-      // Group by date string
-      var groups={},order=[]
-      pages.forEach(function(pg){
-        var k=new Date(pg.visitTs).toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'})
-        if(!groups[k]){groups[k]=[];order.push(k)}
-        groups[k].push(pg)
-      })
-      document.getElementById('ht-results').innerHTML=order.map(function(dateKey){
-        return'<div class="hist-group">'+
-          '<div class="hist-date">'+esc(dateKey)+'</div>'+
-          groups[dateKey].map(function(pg){
-            var kws=(pg.keywords||[]).map(function(w){return'<span class="hist-kw">'+esc(w)+'</span>'}).join('')
-            return'<div class="hist-page">'+
-              '<div class="hist-page-meta"><span class="hist-domain">'+esc(pg.domain)+'</span><span style="font-size:11px;color:#9ca3af">'+new Date(pg.visitTs).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</span></div>'+
-              '<a class="hist-page-title" href="'+esc(pg.url)+'" target="_blank">'+esc(pg.title||pg.url)+'</a>'+
-              (kws?'<div class="hist-kws">'+kws+'</div>':'')+
-            '</div>'
-          }).join('')+
+      var header='<div class="hist-selected-day">'+esc(headerLabel)+'</div>'
+      if(!pages.length){resEl.innerHTML=header+'<div class="empty">No pages on this day</div>';return}
+      resEl.innerHTML=header+pages.map(function(pg){
+        var kws=(pg.keywords||[]).map(function(w){return'<span class="hist-kw">'+esc(w)+'</span>'}).join('')
+        return'<div class="hist-page">'+
+          '<div class="hist-page-meta"><span class="hist-domain">'+esc(pg.domain)+'</span><span style="font-size:11px;color:#9ca3af">'+new Date(pg.visitTs).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</span></div>'+
+          '<a class="hist-page-title" href="'+esc(pg.url)+'" target="_blank">'+esc(pg.title||pg.url)+'</a>'+
+          (kws?'<div class="hist-kws">'+kws+'</div>':'')+
         '</div>'
       }).join('')
     })
-    .catch(function(){document.getElementById('ht-results').innerHTML='<div class="empty">Failed to load</div>'})
+    .catch(function(){resEl.innerHTML='<div class="empty">Failed to load</div>'})
 }
+function htSelectDay(day){
+  if(!day||day===htSelectedDay)return
+  htSelectedDay=day
+  htRenderChart()
+  htRenderListForSelectedDay()
+}
+function htRender(){
+  var p=htPeriod()
+  document.getElementById('ht-label').textContent=htLabel()
+  document.getElementById('ht-chart').innerHTML=''
+  document.getElementById('ht-results').innerHTML='<div class="empty" style="padding:20px 0">Loading…</div>'
+  // Fetch 1: daily counts for the chart (limit=1 — pages list is unused here).
+  fetch('/history?from='+p.from+'&to='+p.to+'&limit=1')
+    .then(function(r){return r.json()})
+    .then(function(d){
+      htDailyCache=d.daily||{}
+      htSelectedDay=htClampSelectedDay(htDailyCache,p.from,p.to)
+      htRenderChart()
+      htRenderListForSelectedDay()
+    })
+    .catch(function(){
+      document.getElementById('ht-results').innerHTML='<div class="empty">Failed to load</div>'
+    })
+}
+document.getElementById('ht-chart').addEventListener('click',function(e){
+  var rect=e.target.closest('rect[data-day]');if(!rect)return
+  htSelectDay(rect.getAttribute('data-day'))
+})
 document.getElementById('ht-prev').addEventListener('click',function(){
   if(htMode==='week')htAnchor.setDate(htAnchor.getDate()-7)
   else htAnchor.setMonth(htAnchor.getMonth()-1)
@@ -1591,8 +1639,15 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				}
 			}
 
-			// Build daily activity map and page list.
-			daily := make(map[string]int)
+			// Daily counts come from a SQL aggregate over the full [from, to)
+			// range — independent of `limit`. The page list below is paginated;
+			// without this, days outside the truncated window would show 0.
+			daily, err := s.GetDailyPageCounts(fromMs, toMs)
+			if err != nil {
+				http.Error(w, `{"error":"history query failed"}`, http.StatusInternalServerError)
+				return
+			}
+
 			type histPageJSON struct {
 				URL      string   `json:"url"`
 				Title    string   `json:"title"`
@@ -1608,8 +1663,6 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				for i, k := range kws {
 					kwStrs[i] = k.Word
 				}
-				dateKey := time.UnixMilli(pe.visitTs).UTC().Format("2006-01-02")
-				daily[dateKey]++
 				pages = append(pages, histPageJSON{
 					URL:      pe.url,
 					Title:    pe.title,

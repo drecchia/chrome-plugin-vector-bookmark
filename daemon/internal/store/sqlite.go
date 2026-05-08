@@ -843,6 +843,33 @@ type HistoryRow struct {
 	Text    string
 }
 
+// GetDailyPageCounts returns a UTC date-keyed (YYYY-MM-DD) count of pages
+// visited in [fromMs, toMs). Independent of any page-list limit — used by the
+// Timeline UI to render accurate per-day bar heights even when the page list
+// is paginated.
+func (s *Store) GetDailyPageCounts(fromMs, toMs int64) (map[string]int, error) {
+	rows, err := s.db.Query(`
+		SELECT strftime('%Y-%m-%d', visit_ts/1000, 'unixepoch') AS day, COUNT(*)
+		FROM pages
+		WHERE visit_ts >= ? AND visit_ts < ?
+		GROUP BY day
+	`, fromMs, toMs)
+	if err != nil {
+		return nil, fmt.Errorf("daily page counts: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var day string
+		var count int
+		if err := rows.Scan(&day, &count); err != nil {
+			continue
+		}
+		out[day] = count
+	}
+	return out, nil
+}
+
 // GetPageHistoryRows returns chunk texts for the top `limit` pages visited in
 // [fromMs, toMs), ordered by visit_ts DESC. The caller groups by PageID and
 // extracts keywords per page.

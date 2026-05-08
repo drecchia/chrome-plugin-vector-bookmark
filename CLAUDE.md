@@ -110,7 +110,7 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 ### Daemon (Go)
 - `cmd/vbmd/main.go` — entrypoint, modo `server`
 - `internal/server/routes.go` — todos os handlers HTTP (chi router)
-- `internal/store/sqlite.go` — schema, migrations, Ingest, RecordVisit, Search (BM25+cosine RRF), Forget, ListTags/ListPagesByTag/GetPageTags
+- `internal/store/sqlite.go` — schema, migrations, Ingest, RecordVisit, Search (BM25+cosine RRF), Forget, ListTags/ListPagesByTag/GetPageTags, GetDailyPageCounts (agregação por dia para a aba Timeline)
 - `internal/chunk/chunk.go` — sliding window chunker (512 tokens, overlap 64, mínimo 40)
 - `internal/embed/` — interface Embedder + StubEmbedder (zeros para dev)
 - `internal/llm/` — cliente OpenAI-compat para chat completions: `Summarize()` (resumo de página, CR-0001) e `SuggestTags()` (até 3 tags reusando taxonomia existente, CR-0003); usa o mesmo `VBM_EMBED_URL`/`VBM_EMBED_API_KEY` do embedder, modelo via `VBM_LLM_MODEL`. **Prompts externalizáveis** via `VBM_LLM_PROMPT_SUMMARIZE_FILE` e `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE` (markdown, lidos no startup, fallback embedded — CR-0006).
@@ -157,6 +157,7 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 20 default, 1000 max (clampado, mínimo 1). UI da aba Search expõe input numérico "Max results". Filtro opcional `?tag=…` restringe candidatos via `page_tags`.
 8. **Modos de ingest**: `full_text` (Readability + meta) | `llm_summary` (resumo via LLM substitui o texto antes do chunking) | `manual` (texto fornecido pelo popup) | `meta_only` (apenas título + meta tags). Default = `full_text`. Em todos os modos, meta + título são prefixados ao corpo, exceto `meta_only` que é apenas o bloco de meta.
 9. **Tags em set-mode**: quando o popup envia ingest com `setTags=true`, a lista de tags vira o estado final daquela página (DELETE + INSERT na mesma tx). `setTags=false`/ausente = merge (INSERT OR IGNORE). Tags são normalizadas para `[a-z0-9 \-_]`, max 64 chars.
+10. **Timeline (UI `/`)**: a aba Timeline da UI HTTP do daemon serve o gráfico via `/history`, cujo campo `daily` vem de uma agregação SQL (`GetDailyPageCounts`) sobre todo o período `[from, to)` — independente do `limit` aplicado à lista de pages. A UI faz dois fetches: um com `limit=1` para o gráfico (todos os dias, contagem real) e um com `from/to` da janela do dia selecionado para a lista. Default do dia selecionado: hoje (UTC) se cair no período; senão último dia com tráfego; senão último dia do período. Click numa barra muda o dia selecionado.
 
 ## Entidades principais (SQLite)
 
