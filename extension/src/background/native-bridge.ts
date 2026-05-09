@@ -4,13 +4,19 @@ export const DEFAULT_PORT = 7532;
 export interface DaemonConfig {
 	host: string;
 	port: number;
+	authToken: string;
 }
 
 export async function getDaemonConfig(): Promise<DaemonConfig> {
-	const result = await chrome.storage.local.get(['vbmHost', 'vbmPort']);
+	const result = await chrome.storage.local.get([
+		'vbmHost',
+		'vbmPort',
+		'vbmAuthToken',
+	]);
 	return {
 		host: (result.vbmHost as string) || DEFAULT_HOST,
 		port: (result.vbmPort as number) || DEFAULT_PORT,
+		authToken: (result.vbmAuthToken as string) || '',
 	};
 }
 
@@ -20,7 +26,14 @@ export async function saveDaemonConfig(
 	const update: Record<string, unknown> = {};
 	if (config.host !== undefined) update.vbmHost = config.host;
 	if (config.port !== undefined) update.vbmPort = config.port;
+	if (config.authToken !== undefined) update.vbmAuthToken = config.authToken;
 	await chrome.storage.local.set(update);
+}
+
+export function authHeader(config: DaemonConfig): Record<string, string> {
+	return config.authToken
+		? { Authorization: `Bearer ${config.authToken}` }
+		: {};
 }
 
 export function getDaemonBase(config: DaemonConfig): string {

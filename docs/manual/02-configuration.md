@@ -93,10 +93,31 @@ The daemon prints all of these in its startup banner so you can confirm what loa
 | `VBM_LOG_LEVEL` | `info` | One of `debug`, `info`, `warn`, `error` |
 | `VBM_LLM_PROMPT_SUMMARIZE_FILE` | unset | Path to a markdown file overriding the built-in summarize prompt |
 | `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE` | unset | Path to a markdown file overriding the built-in tag-suggest prompt |
+| `VBM_AUTH_TOKEN` | unset | Bearer token required on all routes except `/healthz` and `/metrics`. Unset → open access (safe for `127.0.0.1`-only setups) |
 
 ---
 
-## 2.5 Custom prompts
+## 2.5 Auth token (publicly exposed deployments)
+
+The default bind is `127.0.0.1`, so on a single-user machine no auth is needed and `VBM_AUTH_TOKEN` should stay unset. **The moment the daemon is reachable from anywhere other than your loopback** — Docker with a non-loopback port mapping, K8s `Service`, reverse proxy, tunnels — set this:
+
+```
+VBM_AUTH_TOKEN=<long-random-string>
+```
+
+Generate one once and reuse it (`openssl rand -hex 32`). Then enter the same value in the extension popup → Settings → **Auth token**.
+
+How it's enforced:
+
+- HTTP: clients must send `Authorization: Bearer <token>`.
+- WebSocket (`/ws`): browsers can't set custom headers on the handshake, so `?token=<token>` is also accepted.
+- `/healthz` and `/metrics` stay public so probes/scrapers don't break.
+
+Caveat: a `?token=` query string can leak into HTTP access logs and proxy logs. The daemon itself only logs request paths, but if you front it with another proxy, audit its log policy.
+
+---
+
+## 2.6 Custom prompts
 
 The summarize and tag-suggest prompts are externalized so you can tune the voice without rebuilding the daemon:
 
@@ -117,7 +138,7 @@ VBM_LLM_PROMPT_SUMMARIZE_FILE=/home/you/.config/vbm/summarize.md
 
 ---
 
-## 2.6 Extension settings
+## 2.7 Extension settings
 
 Open the popup and find the **Settings** section:
 
@@ -125,6 +146,7 @@ Open the popup and find the **Settings** section:
 |---|---|---|
 | Daemon host | `127.0.0.1` | Where the extension looks for `vbmd` |
 | Daemon port | `7532` | Match this with `VBM_PORT` |
+| Auth token | (empty) | Match this with `VBM_AUTH_TOKEN`. Leave empty when the daemon has no token configured |
 | Dwell threshold (ms) | `10000` | Minimum visible time before a page is auto-indexed |
 | Blacklist | (empty) | Hostname patterns the extension never sends to the daemon |
 

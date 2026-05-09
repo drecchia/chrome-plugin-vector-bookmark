@@ -46,6 +46,7 @@ var envSpecs = []envSpec{
 	{"VBM_LLM_SUGGEST_TAGS_MAX", "default: 3 (clamped to 1-25)"},
 	{"VBM_TTL_DAYS", "retention disabled"},
 	{"VBM_CORS_ORIGIN", ""},
+	{"VBM_AUTH_TOKEN", "no auth (open access)"},
 }
 
 // logEnvBanner prints which env vars are consulted and which are unset. Never
@@ -192,7 +193,12 @@ func Run() error {
 		}
 	}
 
-	r := newRouter(s, q, version, extraOrigins, llmClient)
+	authToken := os.Getenv("VBM_AUTH_TOKEN")
+	if authToken != "" {
+		slog.Info("auth token configured — Bearer/?token required on protected routes")
+	}
+
+	r := newRouter(s, q, version, extraOrigins, llmClient, authToken)
 
 	srv := &http.Server{
 		Handler:           r,

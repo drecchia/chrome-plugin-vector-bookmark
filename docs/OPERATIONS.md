@@ -70,6 +70,7 @@ Todas as variáveis são lidas no startup do daemon (`daemon/internal/server/ser
 | `VBM_TTL_DAYS` | *(sem retenção)* | Recomendada | Retenção LGPD: páginas com `visit_ts` mais antigo que N dias são removidas por um ticker 24h. |
 | `VBM_LOG_LEVEL` | `info` | Não | `debug` / `info` / `warn` / `error`. Handler é slog JSON em stderr. |
 | `VBM_CORS_ORIGIN` | *(vazio)* | Condicional | CSV de origens extras (além de `chrome-extension://*`) aceitas para requisições HTTP. Necessário para dashboards externos. |
+| `VBM_AUTH_TOKEN` | *(vazio)* | **Obrigatória se exposto** | Bearer token exigido em todas as rotas exceto `/healthz` e `/metrics`. Vazio = acesso aberto — só aceitável quando `VBM_BIND=127.0.0.1`. WS aceita `?token=…` na query (browsers não enviam header custom no handshake). Configurar o mesmo valor no popup → Settings → Auth token. |
 
 **Caminhos de dados por plataforma:**
 

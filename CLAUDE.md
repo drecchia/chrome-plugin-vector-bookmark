@@ -62,7 +62,7 @@ Env file carregado no startup do daemon:
 - Linux:   `~/.config/vbm/env`
 - Windows: `%APPDATA%\vbm\env`
 
-Vars consultadas: `VBM_PORT`, `VBM_BIND`, `VBM_EMBED_URL`, `VBM_EMBED_API_KEY`, `VBM_LLM_MODEL`, `VBM_TTL_DAYS`, `VBM_DATA_DIR`, `VBM_LOG_LEVEL`, `VBM_LLM_PROMPT_SUMMARIZE_FILE`, `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE`. O banner de startup (`logEnvBanner`) imprime todas — manter o slice `envSpecs` em sync ao adicionar uma nova env.
+Vars consultadas: `VBM_PORT`, `VBM_BIND`, `VBM_EMBED_URL`, `VBM_EMBED_API_KEY`, `VBM_LLM_MODEL`, `VBM_TTL_DAYS`, `VBM_DATA_DIR`, `VBM_LOG_LEVEL`, `VBM_LLM_PROMPT_SUMMARIZE_FILE`, `VBM_LLM_PROMPT_SUGGEST_TAGS_FILE`, `VBM_AUTH_TOKEN`. O banner de startup (`logEnvBanner`) imprime todas — manter o slice `envSpecs` em sync ao adicionar uma nova env.
 
 Documentação adicional em `docs/`: `GUIA.md` (uso), `OPERATIONS.md` (operação), `bootstrap/` e `maturity/` (artefatos de processo).
 

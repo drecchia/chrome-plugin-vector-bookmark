@@ -1065,7 +1065,7 @@ type reindexState struct {
 // newRouter builds the HTTP router. extraOrigins are additional CORS-allowed origins
 // beyond chrome-extension:// (e.g. a local dashboard, configured via VBM_CORS_ORIGIN).
 // llmClient may be nil; when nil, mode=llm_summary returns 503.
-func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string, llmClient *llm.Client) http.Handler {
+func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string, llmClient *llm.Client, authToken string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -1089,6 +1089,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 
 	r.Group(func(r chi.Router) {
 		r.Use(corsMiddleware(extraOrigins))
+		r.Use(authMiddleware(authToken, extraOrigins))
 
 		// POST /visit — passive history record + lightweight meta indexing.
 		r.Post("/visit", func(w http.ResponseWriter, req *http.Request) {
@@ -1848,37 +1849,44 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 	return r
 }
 
+// authMiddleware enforces a Bearer token when one is configured. When token is
+// empty the middleware is a no-op (open access — preserves local-only setups).
+// HTTP clients pass the token via Authorization: Bearer <token>; browser
+// WebSocket clients can't set custom headers on handshake, so ?token=<token>
+// query string is also accepted.
 func authMiddleware(token string, extraOrigins []string) func(http.Handler) http.Handler {
+	if token == "" {
+		return func(next http.Handler) http.Handler { return next }
+	}
 	allowed := make(map[string]bool, len(extraOrigins))
 	for _, o := range extraOrigins {
 		if o != "" {
 			allowed[o] = true
 		}
 	}
+	expected := "Bearer " + token
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Handle CORS preflight without auth check
 			if r.Method == http.MethodOptions {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Check Origin header — allow chrome-extension:// and any extraOrigins (P0-NEW: fix ordering bug)
 			origin := r.Header.Get("Origin")
 			if origin != "" && !strings.HasPrefix(origin, "chrome-extension://") && !allowed[origin] {
 				http.Error(w, `{"error":"forbidden origin"}`, http.StatusUnauthorized)
 				return
 			}
 
-			// Check Authorization header
-			authHeader := r.Header.Get("Authorization")
-			expected := "Bearer " + token
-			if authHeader != expected {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			if r.Header.Get("Authorization") == expected {
+				next.ServeHTTP(w, r)
 				return
 			}
-
-			next.ServeHTTP(w, r)
+			if r.URL.Query().Get("token") == token {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		})
 	}
 }

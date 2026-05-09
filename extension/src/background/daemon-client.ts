@@ -9,7 +9,7 @@ import {
 	type SuggestTagsRequest,
 	type SuggestTagsResponse,
 } from '../../../proto/types';
-import { getDaemonConfig, getDaemonBase } from './native-bridge';
+import { getDaemonConfig, getDaemonBase, authHeader } from './native-bridge';
 
 async function checkResponse(res: Response): Promise<void> {
 	if (!res.ok) {
@@ -28,7 +28,7 @@ export async function recordVisit(req: VisitRequest): Promise<void> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/visit`, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify(req),
 	});
 	await checkResponse(res);
@@ -38,7 +38,7 @@ export async function ingest(req: IngestRequest): Promise<void> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/ingest`, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify(req),
 	});
 	await checkResponse(res);
@@ -50,7 +50,9 @@ export async function search(
 ): Promise<SearchResult[]> {
 	const cfg = await getDaemonConfig();
 	const params = new URLSearchParams({ q: query, limit: String(limit) });
-	const res = await fetch(`${getDaemonBase(cfg)}/search?${params}`);
+	const res = await fetch(`${getDaemonBase(cfg)}/search?${params}`, {
+		headers: authHeader(cfg),
+	});
 	await checkResponse(res);
 	const data = (await res.json()) as SearchResponse;
 	return data.results;
@@ -60,7 +62,7 @@ export async function forget(req: ForgetRequest): Promise<void> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/forget`, {
 		method: 'DELETE',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify(req),
 	});
 	await checkResponse(res);
@@ -75,7 +77,9 @@ export async function getStatus(): Promise<{
 	embedderVersion: string;
 }> {
 	const cfg = await getDaemonConfig();
-	const res = await fetch(`${getDaemonBase(cfg)}/status`);
+	const res = await fetch(`${getDaemonBase(cfg)}/status`, {
+		headers: authHeader(cfg),
+	});
 	await checkResponse(res);
 	const data = (await res.json()) as {
 		visited: number;
@@ -94,7 +98,9 @@ export async function getStatus(): Promise<{
 export async function healthz(): Promise<boolean> {
 	try {
 		const cfg = await getDaemonConfig();
-		const res = await fetch(`${getDaemonBase(cfg)}/healthz`);
+		const res = await fetch(`${getDaemonBase(cfg)}/healthz`, {
+			headers: authHeader(cfg),
+		});
 		return res.ok;
 	} catch {
 		return false;
@@ -105,7 +111,9 @@ export async function pageStatus(url: string): Promise<PageStatusResponse> {
 	try {
 		const cfg = await getDaemonConfig();
 		const params = new URLSearchParams({ url });
-		const res = await fetch(`${getDaemonBase(cfg)}/page?${params}`);
+		const res = await fetch(`${getDaemonBase(cfg)}/page?${params}`, {
+			headers: authHeader(cfg),
+		});
 		if (!res.ok) return { exists: false, indexed: false };
 		return (await res.json()) as PageStatusResponse;
 	} catch {
@@ -119,7 +127,7 @@ export async function suggestTags(
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/tags/suggest`, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify(req),
 	});
 	if (!res.ok) {
@@ -134,7 +142,9 @@ export async function suggestTags(
 export async function listTags(): Promise<TagCount[]> {
 	try {
 		const cfg = await getDaemonConfig();
-		const res = await fetch(`${getDaemonBase(cfg)}/tags`);
+		const res = await fetch(`${getDaemonBase(cfg)}/tags`, {
+			headers: authHeader(cfg),
+		});
 		if (!res.ok) return [];
 		const data = (await res.json()) as { tags: TagCount[] };
 		return data.tags ?? [];
@@ -146,7 +156,9 @@ export async function listTags(): Promise<TagCount[]> {
 export async function getBlacklist(): Promise<string[]> {
 	try {
 		const cfg = await getDaemonConfig();
-		const res = await fetch(`${getDaemonBase(cfg)}/blacklist`);
+		const res = await fetch(`${getDaemonBase(cfg)}/blacklist`, {
+			headers: authHeader(cfg),
+		});
 		if (!res.ok) return [];
 		const data = (await res.json()) as { patterns: string[] };
 		return data.patterns ?? [];
@@ -159,7 +171,7 @@ export async function addToBlacklist(pattern: string): Promise<void> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/blacklist`, {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify({ pattern }),
 	});
 	await checkResponse(res);
@@ -169,7 +181,7 @@ export async function removeFromBlacklist(pattern: string): Promise<void> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/blacklist`, {
 		method: 'DELETE',
-		headers: { 'Content-Type': 'application/json' },
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
 		body: JSON.stringify({ pattern }),
 	});
 	await checkResponse(res);
@@ -179,6 +191,7 @@ export async function reindex(): Promise<{ started: boolean }> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex`, {
 		method: 'POST',
+		headers: authHeader(cfg),
 	});
 	if (res.status === 409) return { started: false }; // already running
 	await checkResponse(res);
@@ -191,7 +204,9 @@ export async function getReindexStatus(): Promise<{
 	total: number;
 }> {
 	const cfg = await getDaemonConfig();
-	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex/status`);
+	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex/status`, {
+		headers: authHeader(cfg),
+	});
 	await checkResponse(res);
 	return res.json() as Promise<{
 		running: boolean;

@@ -44,6 +44,8 @@ export default function App() {
 	const [showSettings, setShowSettings] = useState(false);
 	const [host, setHost] = useState(DEFAULT_HOST);
 	const [port, setPort] = useState(String(DEFAULT_PORT));
+	const [authToken, setAuthToken] = useState('');
+	const [showAuthToken, setShowAuthToken] = useState(false);
 	const [dwellSecs, setDwellSecs] = useState(String(DEFAULT_DWELL_MS / 1000));
 	const [pageExists, setPageExists] = useState<boolean | null>(null);
 	const [pageIndexed, setPageIndexed] = useState<boolean | null>(null);
@@ -63,12 +65,14 @@ export default function App() {
 
 	useEffect(() => {
 		chrome.storage.local.get(
-			['vbmHost', 'vbmPort', 'vbmDwellMs'],
+			['vbmHost', 'vbmPort', 'vbmDwellMs', 'vbmAuthToken'],
 			(result) => {
 				if (result.vbmHost) setHost(result.vbmHost as string);
 				if (result.vbmPort) setPort(String(result.vbmPort));
 				if (result.vbmDwellMs)
 					setDwellSecs(String((result.vbmDwellMs as number) / 1000));
+				if (result.vbmAuthToken)
+					setAuthToken(result.vbmAuthToken as string);
 			},
 		);
 	}, []);
@@ -317,7 +321,11 @@ export default function App() {
 		const dwellMs =
 			isNaN(d) || d < 1 ? DEFAULT_DWELL_MS : Math.round(d * 1000);
 		Promise.all([
-			saveDaemonConfig({ host: host.trim(), port: p }),
+			saveDaemonConfig({
+				host: host.trim(),
+				port: p,
+				authToken: authToken.trim(),
+			}),
 			saveDwellThreshold(dwellMs),
 		]).then(() => {
 			flash('Saved');
@@ -542,6 +550,34 @@ export default function App() {
 									e.key === 'Enter' && handleSaveConfig()
 								}
 							/>
+							<button
+								style={s.btnGray}
+								onClick={handleSaveConfig}
+							>
+								Save
+							</button>
+						</div>
+					</div>
+					<div>
+						<div style={s.label}>Auth token (optional)</div>
+						<div style={s.row}>
+							<input
+								style={s.input}
+								type={showAuthToken ? 'text' : 'password'}
+								placeholder="leave empty if daemon has no token"
+								value={authToken}
+								onChange={(e) => setAuthToken(e.target.value)}
+								onKeyDown={(e) =>
+									e.key === 'Enter' && handleSaveConfig()
+								}
+							/>
+							<button
+								style={s.btnGray}
+								onClick={() => setShowAuthToken((v) => !v)}
+								title={showAuthToken ? 'Hide' : 'Show'}
+							>
+								{showAuthToken ? 'Hide' : 'Show'}
+							</button>
 							<button
 								style={s.btnGray}
 								onClick={handleSaveConfig}
