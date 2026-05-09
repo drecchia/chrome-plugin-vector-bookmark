@@ -65,14 +65,28 @@ https://github.com/drecchia/chrome-plugin-vector-bookmark/issues
 
 Build a private, local semantic index of pages the user reads, and let them recall those pages later by meaning. Every feature (capture, tagging, search, timeline) serves that single purpose.
 
-## Permission justifications
+## Permission justifications (dashboard-ready)
 
-- **tabs / webNavigation**: detect navigation events so the content script can start measuring dwell time on the active tab.
-- **storage**: persist user settings (daemon host/port, dwell threshold) in `chrome.storage.local`.
-- **scripting**: inject the on-demand content script that extracts page body text via Mozilla Readability when the user clicks "Index this site now".
-- **omnibox**: register the `@recall` keyword so the user can search their index from the address bar.
-- **idle**: pause dwell tracking when the OS is idle so background tabs don't accumulate fake reading time.
-- **host_permissions `<all_urls>`**: the extension's purpose is recall across the user's entire browsing; capture is gated by their blacklist and dwell threshold.
+**tabs**
+> The extension uses the tabs API to read the active tab's URL and title when starting a dwell timer and when the user clicks "Index this site now" in the popup. Without this, the extension cannot know which page the user is currently reading.
+
+**webNavigation**
+> The extension's core feature is to detect when the user navigates to a new page so it can start a dwell timer (default 10 seconds) on the active tab. Once the timer elapses, the page metadata is sent to a local daemon for indexing. The webNavigation API is the only reliable way to observe navigation lifecycle events (committed, completed, history-state updates) across all sites the user visits, including SPA route changes that don't trigger a full page load.
+
+**storage**
+> Persists user settings (daemon host, port, dwell threshold, hostname blacklist) in chrome.storage.local. Without this, every browser restart would reset the user's configuration.
+
+**scripting**
+> Injects the on-demand content script that extracts the current page's body text via Mozilla Readability when the user clicks "Index this site now". The content script is also responsible for client-side intents like grabbing a YouTube transcript or the user's text selection. Programmatic injection (instead of a static content script for every page) keeps the extension's footprint minimal until the user explicitly asks for an extraction.
+
+**omnibox**
+> Registers the @recall keyword so the user can search their personal index directly from the Chrome address bar (e.g. "@recall tokio async-std comparison"). This is the fastest recall surface and is one of the extension's signature features.
+
+**idle**
+> The extension measures how long a page is actively visible to the user before indexing it. When the operating system is idle (locked, screensaver, no input), tabs left open should not accumulate fake reading time. The idle API is used to pause the dwell timer during system idle states and resume it when the user returns. Without this, background tabs would inflate reading-time signals and pollute the user's semantic index.
+
+**host_permissions `<all_urls>`**
+> The single purpose of Vector Bookmark is to build a personal semantic index of every page the user reads, so it can be recalled later by meaning. To deliver that value, the extension must observe pages on any site the user visits — restricting host permissions to a fixed list would break the product's core promise. The user retains full control through three mechanisms: (1) incognito tabs are never captured (declared in the manifest, not configurable), (2) password fields and known auth/checkout URLs are excluded by the content script, and (3) a user-managed blacklist lets the user block any host they don't want indexed. All captured data is sent only to a local daemon on 127.0.0.1; nothing is transmitted to remote servers without explicit user configuration.
 
 ## Assets
 
