@@ -695,7 +695,7 @@ export default function App() {
 					)}
 					{status.daemonPort && connected && (
 						<a
-							href={`http://${host}:${status.daemonPort}/ui`}
+							href={`http://${host}:${status.daemonPort}/ui${authToken ? `?token=${encodeURIComponent(authToken)}` : ''}`}
 							target="_blank"
 							rel="noreferrer"
 							style={s.uiLink}
