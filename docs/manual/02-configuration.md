@@ -111,6 +111,7 @@ How it's enforced:
 
 - HTTP: clients must send `Authorization: Bearer <token>`.
 - WebSocket (`/ws`): browsers can't set custom headers on the handshake, so `?token=<token>` is also accepted.
+- Daemon UI (`/`, `/ui`): open it once with `?token=<token>` in the URL — the UI captures the token into `sessionStorage`, strips it from the address bar, and injects `Authorization` on every subsequent fetch. If you forget the URL param the UI prompts on the first 401.
 - `/healthz` and `/metrics` stay public so probes/scrapers don't break.
 
 Caveat: a `?token=` query string can leak into HTTP access logs and proxy logs. The daemon itself only logs request paths, but if you front it with another proxy, audit its log policy.

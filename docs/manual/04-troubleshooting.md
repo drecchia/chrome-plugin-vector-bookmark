@@ -12,6 +12,7 @@
 | Page indexed but not in search results | Stub embedder + word never appears in BM25; configure embeddings (see 4.5) |
 | `/ingest` returns 503 with `mode=llm_summary` | `VBM_LLM_MODEL` / `VBM_EMBED_URL` not set; see [02-configuration.md](02-configuration.md) |
 | Every request returns `401 unauthorized` | Daemon has `VBM_AUTH_TOKEN` set — paste the same value into popup → Settings → Auth token, or unset it on the daemon side |
+| Daemon UI (`/ui`) loads but every panel is empty / 401 | Open the page once with `?token=<your-token>` (e.g. `http://host:7532/?token=abc`). The UI captures the token into `sessionStorage`, strips it from the URL, and injects it into every subsequent request. If the token expires or you skip the URL param, the UI prompts you for it on the first 401 |
 | ✨ Suggest tags returns "no LLM configured" | Same — `VBM_LLM_MODEL` missing |
 | Re-embed button not visible | No pages indexed yet — the button only shows once `status.indexed > 0` |
 | Daemon won't start in Docker | See 4.3 |

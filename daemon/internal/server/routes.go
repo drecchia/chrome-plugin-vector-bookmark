@@ -329,6 +329,43 @@ input[type=range]#conf-slider{width:100%;accent-color:#111}
   </div>
 </div>
 <script>
+// Auth bootstrap: capture ?token=... from URL into sessionStorage, strip it
+// from the address bar, and inject Authorization on every fetch. On 401,
+// prompt once for the token and reload. No-op when daemon has no auth.
+(function(){
+  try {
+    var u = new URL(window.location.href);
+    var t = u.searchParams.get('token');
+    if (t) {
+      sessionStorage.setItem('vbmAuthToken', t);
+      u.searchParams.delete('token');
+      window.history.replaceState({}, '', u.pathname + (u.search ? u.search : '') + u.hash);
+    }
+  } catch(e) {}
+  var origFetch = window.fetch.bind(window);
+  var prompted = false;
+  window.fetch = function(input, init) {
+    init = init || {};
+    var token = sessionStorage.getItem('vbmAuthToken');
+    if (token) {
+      var hdrs = new Headers(init.headers || {});
+      if (!hdrs.has('Authorization')) hdrs.set('Authorization', 'Bearer ' + token);
+      init.headers = hdrs;
+    }
+    return origFetch(input, init).then(function(res){
+      if (res.status === 401 && !prompted) {
+        prompted = true;
+        var current = sessionStorage.getItem('vbmAuthToken') || '';
+        var entered = window.prompt('VBM auth token required:', current);
+        if (entered && entered !== current) {
+          sessionStorage.setItem('vbmAuthToken', entered);
+          window.location.reload();
+        }
+      }
+      return res;
+    });
+  };
+})();
 var q=document.getElementById('q'),btn=document.getElementById('search-btn'),res=document.getElementById('results'),stat=document.getElementById('stat')
 fetch('/status').then(function(r){return r.json()}).then(function(d){stat.textContent=d.indexed+' pages indexed'}).catch(function(){})
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
