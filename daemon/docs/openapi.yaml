@@ -1,0 +1,696 @@
+openapi: 3.0.3
+info:
+  title: vbmd — Vector Bookmark Daemon
+  description: |
+    Local-only HTTP API for the Vector Bookmark daemon (`vbmd`). Captures passive
+    browsing visits, indexes content with hybrid BM25 + vector search, and exposes
+    tagging, history, topics, and admin operations.
+
+    All endpoints bind to `127.0.0.1:7532` by default (configurable via `VBM_PORT` /
+    `VBM_BIND`). Bearer auth is enabled when `VBM_AUTH_TOKEN` is set.
+  version: "1.1.1"
+  license:
+    name: Internal
+servers:
+  - url: http://127.0.0.1:7532
+    description: Default local daemon
+security:
+  - bearerAuth: []
+  - tokenQuery: []
+  - {}
+
+tags:
+  - name: health
+  - name: ingest
+  - name: search
+  - name: pages
+  - name: tags
+  - name: history
+  - name: topics
+  - name: blacklist
+  - name: admin
+  - name: ui
+  - name: realtime
+
+paths:
+
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean, example: true } }
+        "503":
+          description: Database unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain: { schema: { type: string } }
+
+  /status:
+    get:
+      tags: [health]
+      summary: Stats overview
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+
+  /visit:
+    post:
+      tags: [ingest]
+      summary: Record a passive page visit (lightweight meta indexing)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VisitRequest" }
+      responses:
+        "200": { description: Recorded, content: { application/json: { schema: { $ref: "#/components/schemas/Ok" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /ingest:
+    post:
+      tags: [ingest]
+      summary: Queue a page for full text/embedding indexing
+      description: |
+        Modes:
+        - `full_text` (default): chunk + embed the supplied text
+        - `llm_summary`: run LLM summarization before chunking (requires `VBM_EMBED_URL`)
+        - `manual`: index the supplied text as-is (popup-provided)
+        - `meta_only`: index title + meta tags only
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IngestRequest" }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { queued: { type: boolean, example: true } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { description: Request body too large, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: LLM call failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: LLM unavailable (mode=llm_summary without VBM_EMBED_URL), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /search:
+    get:
+      tags: [search]
+      summary: Hybrid BM25 + vector search (RRF)
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, minimum: 1, maximum: 1000 }
+        - in: query
+          name: min_confidence
+          schema: { type: number, format: float, default: 0.0, minimum: 0.0, maximum: 1.0 }
+        - in: query
+          name: source
+          schema: { type: string, enum: [indexed, history] }
+        - in: query
+          name: tag
+          description: Repeatable — include results carrying this tag
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - in: query
+          name: neg_tag
+          description: Repeatable — exclude results carrying this tag
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /forget:
+    delete:
+      tags: [pages]
+      summary: Delete pages by URL, domain, or time range
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ForgetRequest" }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { forgotten: { type: boolean, example: true } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /page:
+    get:
+      tags: [pages]
+      summary: Check whether a URL is known/indexed and list its tags
+      parameters:
+        - in: query
+          name: url
+          required: true
+          schema: { type: string, format: uri }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PageStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /page/tags:
+    put:
+      tags: [tags]
+      summary: Replace the tag set of a page (set-mode)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PageTagsRequest" }
+      responses:
+        "200":
+          description: Tags updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: Page not found, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /tags:
+    get:
+      tags: [tags]
+      summary: List all tags with page counts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items: { $ref: "#/components/schemas/TagCount" }
+
+  /tags/suggest:
+    post:
+      tags: [tags]
+      summary: LLM-suggested tags for a page (≤3 suggestions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SuggestTagsRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { description: LLM call failed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: LLM not configured, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /pages:
+    get:
+      tags: [pages]
+      summary: List pages carrying a tag
+      parameters:
+        - in: query
+          name: tag
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: array
+                    items: { $ref: "#/components/schemas/TaggedPage" }
+                  total: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /blacklist:
+    get:
+      tags: [blacklist]
+      summary: List blacklist patterns
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  patterns:
+                    type: array
+                    items: { type: string }
+    post:
+      tags: [blacklist]
+      summary: Add a blacklist pattern
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlacklistPattern" }
+      responses:
+        "200": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Ok" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    delete:
+      tags: [blacklist]
+      summary: Remove a blacklist pattern
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BlacklistPattern" }
+      responses:
+        "200": { description: Removed, content: { application/json: { schema: { $ref: "#/components/schemas/Ok" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /export:
+    get:
+      tags: [pages]
+      summary: Export every page + chunks (LGPD portability)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: array
+                    items: { $ref: "#/components/schemas/ExportPage" }
+                  total: { type: integer }
+
+  /history:
+    get:
+      tags: [history]
+      summary: Chronological browsing history with per-day counts
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema: { type: integer, format: int64, description: Start (unix ms, inclusive) }
+        - in: query
+          name: to
+          required: true
+          schema: { type: integer, format: int64, description: End (unix ms, exclusive) }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HistoryResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /topics:
+    get:
+      tags: [topics]
+      summary: Top keywords for a time window
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: to
+          required: true
+          schema: { type: integer, format: int64 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20, maximum: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TopicsResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /admin/reindex:
+    post:
+      tags: [admin]
+      summary: Kick off a background re-embedding pass
+      responses:
+        "202":
+          description: Started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { started: { type: boolean, example: true } }
+        "409": { description: Already running, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /admin/reindex/status:
+    get:
+      tags: [admin]
+      summary: Reindex progress
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReindexStatus" }
+
+  /ws:
+    get:
+      tags: [realtime]
+      summary: WebSocket — periodic status updates
+      description: |
+        Upgrades to WebSocket. Server pushes `{type:"status", indexed, pending}`
+        every 5s and pings every 30s for keepalive.
+      responses:
+        "101": { description: Switching Protocols }
+
+  /ui:
+    get:
+      tags: [ui]
+      summary: Embedded dashboard (HTML)
+      security: []
+      responses:
+        "200":
+          description: HTML
+          content:
+            text/html: { schema: { type: string } }
+  /ui/{path}:
+    get:
+      tags: [ui]
+      summary: Embedded dashboard static asset
+      security: []
+      parameters:
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Asset }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token from `VBM_AUTH_TOKEN`
+    tokenQuery:
+      type: apiKey
+      in: query
+      name: token
+      description: Same token as Authorization header (used by `<a>` links and websockets)
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ServerError:
+      description: Internal error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+
+    Ok:
+      type: object
+      properties:
+        ok: { type: boolean, example: true }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    PageMeta:
+      type: object
+      properties:
+        description:    { type: string }
+        keywords:       { type: string }
+        ogDescription:  { type: string }
+        author:         { type: string }
+
+    VisitRequest:
+      type: object
+      required: [url, visitTs]
+      properties:
+        url:     { type: string, format: uri }
+        title:   { type: string }
+        visitTs: { type: integer, format: int64, description: Unix milliseconds }
+        dwellMs: { type: integer, format: int64 }
+        domain:  { type: string }
+        meta:    { $ref: "#/components/schemas/PageMeta" }
+
+    IngestRequest:
+      type: object
+      required: [url, visitTs]
+      properties:
+        url:     { type: string, format: uri }
+        title:   { type: string }
+        text:    { type: string }
+        visitTs: { type: integer, format: int64 }
+        dwellMs: { type: integer, format: int64 }
+        domain:  { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        mode:
+          type: string
+          enum: [full_text, llm_summary, manual, meta_only]
+          default: full_text
+        setTags:
+          type: boolean
+          description: When true, supplied tags replace the existing tag set (set-mode)
+
+    ForgetRequest:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          enum: [url, domain, timerange]
+        value:
+          type: string
+          description: |
+            - For `url`: full URL.
+            - For `domain`: hostname.
+            - For `timerange`: `fromMs:toMs` (both unix ms).
+
+    Status:
+      type: object
+      properties:
+        visited:           { type: integer }
+        indexed:           { type: integer }
+        pending:           { type: integer }
+        version:           { type: string }
+        embedder_version:  { type: string }
+
+    SearchHit:
+      type: object
+      properties:
+        url:       { type: string, format: uri }
+        title:     { type: string }
+        snippet:   { type: string }
+        snippets:
+          type: array
+          items: { type: string }
+        visitTs:   { type: integer, format: int64 }
+        score:     { type: number, format: double }
+        domain:    { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        source:
+          type: string
+          enum: [indexed, history]
+
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/SearchHit" }
+        total: { type: integer }
+
+    PageStatus:
+      type: object
+      properties:
+        exists:  { type: boolean }
+        indexed: { type: boolean }
+        tags:
+          type: array
+          items: { type: string }
+
+    PageTagsRequest:
+      type: object
+      required: [url, tags]
+      properties:
+        url:  { type: string, format: uri }
+        tags:
+          type: array
+          items: { type: string }
+
+    TagCount:
+      type: object
+      properties:
+        tag:   { type: string }
+        count: { type: integer }
+
+    TaggedPage:
+      type: object
+      properties:
+        url:     { type: string, format: uri }
+        title:   { type: string }
+        domain:  { type: string }
+        visitTs: { type: integer, format: int64 }
+        tags:
+          type: array
+          items: { type: string }
+
+    SuggestTagsRequest:
+      type: object
+      required: [url, title, text]
+      properties:
+        url:   { type: string, format: uri }
+        title: { type: string }
+        text:
+          type: string
+          minLength: 100
+
+    BlacklistPattern:
+      type: object
+      required: [pattern]
+      properties:
+        pattern: { type: string }
+
+    ExportChunk:
+      type: object
+      properties:
+        chunkIdx: { type: integer }
+        text:     { type: string }
+
+    ExportPage:
+      type: object
+      properties:
+        url:     { type: string, format: uri }
+        title:   { type: string }
+        domain:  { type: string }
+        visitTs: { type: integer, format: int64 }
+        dwellMs: { type: integer, format: int64 }
+        chunks:
+          type: array
+          items: { $ref: "#/components/schemas/ExportChunk" }
+
+    HistoryPage:
+      type: object
+      properties:
+        url:     { type: string, format: uri }
+        title:   { type: string }
+        domain:  { type: string }
+        visitTs: { type: integer, format: int64 }
+        keywords:
+          type: array
+          items: { type: string }
+
+    HistoryResponse:
+      type: object
+      properties:
+        pages:
+          type: array
+          items: { $ref: "#/components/schemas/HistoryPage" }
+        total: { type: integer }
+        daily:
+          type: object
+          additionalProperties: { type: integer }
+          description: Per-day page counts keyed by `YYYY-MM-DD` (UTC)
+
+    TopicKeyword:
+      type: object
+      properties:
+        word:  { type: string }
+        count: { type: integer }
+
+    TopicsResponse:
+      type: object
+      properties:
+        keywords:
+          type: array
+          items: { $ref: "#/components/schemas/TopicKeyword" }
+        total_chunks: { type: integer }
+        from:         { type: integer, format: int64 }
+        to:           { type: integer, format: int64 }
+
+    ReindexStatus:
+      type: object
+      properties:
+        running: { type: boolean }
+        done:    { type: integer }
+        total:   { type: integer }
