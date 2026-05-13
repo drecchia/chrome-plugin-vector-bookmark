@@ -23,4 +23,9 @@ Thumbs.db
 .idea/
 *.swp
 
+node_modules
+
+# Migration scripts: resume state (contains personal bookmark URLs)
+daemon/scripts/*/.import-*.state.json
+
 k8s/vortus-development/

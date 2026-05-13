@@ -1,0 +1,21 @@
+{
+	"name": "migrate-obsidian",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Port Obsidian 'To Deeply Check' bookmarks into the Vector Bookmarks daemon.",
+	"main": "import-obsidian.mjs",
+	"bin": {
+		"import-obsidian": "./import-obsidian.mjs"
+	},
+	"scripts": {
+		"start": "node import-obsidian.mjs"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"dependencies": {
+		"@mozilla/readability": "^0.5.0",
+		"jsdom": "^24.1.0"
+	}
+}
