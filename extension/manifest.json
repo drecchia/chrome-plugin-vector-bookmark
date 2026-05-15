@@ -1,7 +1,7 @@
 {
 	"manifest_version": 3,
 	"name": "Vector Bookmark",
-	"version": "1.1.1",
+	"version": "1.1.2",
 	"description": "Semantic recall for everything you've read. 100% local hybrid BM25 + vector search across your browsing history.",
 	"homepage_url": "https://github.com/drecchia/chrome-plugin-vector-bookmark",
 	"minimum_chrome_version": "116",
