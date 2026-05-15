@@ -39,23 +39,61 @@ const maxPromptFileBytes = 16 * 1024
 
 // defaultSummarizePrompt is used when VBM_LLM_PROMPT_SUMMARIZE_FILE is unset
 // or unreadable. CR-0006.
-const defaultSummarizePrompt = "Summarize the following web page content for retrieval and search purposes. " +
-	"Target 200-400 words. Preserve technical terms, names, dates, key claims, and any code or commands mentioned. " +
-	"Output plain prose with no headers, no bullet lists, and no markdown."
+const defaultSummarizePrompt = `You are summarizing a single web page so it can be retrieved later by semantic and keyword search.
+
+STEP 1 — Identify the subject. A page is primarily ABOUT one canonical thing: a software project, a library, a product, a video, an article, a paper, a tool, a person. Identify it before writing anything. The HTML title and the top of the body usually carry this. Lead the summary with one or two sentences that state what the page IS and what it exists to present (e.g., "X is a free open-source SVG icon set with N icons" / "Y is a YouTube video by Z explaining ..." / "owner/repo is a TypeScript library for ...").
+
+STEP 2 — Describe around the subject. Cover, when present: purpose / problem solved, distinctive features, technologies and stack, key facts (numbers, names, versions, dates, authors), and intended audience. Preserve technical terms, proper nouns, and any code/commands verbatim.
+
+IGNORE noise that is NOT about the subject: user comments, reactions, related/recommended links, navigation, footers, cookie banners, ads, "you might also like" blocks, and platform chrome. Do not let audience-generated text shape the summary.
+
+The platform hosting the page (GitHub, YouTube, npm, Medium, etc.) is the HOST, not the subject. Do not describe the platform.
+
+Focus on what the subject IS and DOES. Mention build, packaging, deployment, OS support, CI, or distribution channels only when they are central to the subject; do not let how-to-install-and-build sections dominate the summary of a library whose purpose is something else.
+
+Do not invent facts that are not in the text. Respond in the page's primary language.
+
+Target 200-400 words; shorter is fine for genuinely thin pages. Output plain prose only — no headers, no bullet lists, no markdown.`
 
 // defaultSuggestTagsPromptTemplate is the system message for the SuggestTags
 // call. %d is replaced with the configured upper bound at client construction.
 // The user message is dynamically built with the existing taxonomy + title +
 // content; only this fixed system prompt is externalisable.
-const defaultSuggestTagsPromptTemplate = "You generate tags for retrieval and curation of saved web pages. " +
-	"Output up to %d short tags (1-2 words each, lowercase, kebab-case, no leading '#'). " +
-	"Prefer covering all relevant topics, themes, technologies, entities and use-cases " +
-	"present in the page rather than being terse — return fewer tags only when the page " +
-	"is genuinely narrow in scope. " +
-	"Reuse from the existing tag list when applicable; otherwise create new tags " +
-	"that match the same style. " +
-	"Output STRICT JSON only, exactly in this shape: {\"tags\":[\"tag-one\",\"tag-two\"]}. " +
-	"No prose, no markdown fences, no explanation."
+const defaultSuggestTagsPromptTemplate = `You generate retrieval tags for a single web page. Output up to %d tags. Use as many as the page genuinely warrants — do NOT pad to reach the limit; returning 3 well-chosen tags is better than 10 weak ones.
+
+Before emitting tags, mentally fill three layers in this order:
+
+1. IDENTITY — the canonical name of the subject the page is about: a repo name, library name, product name, video creator or distinct video topic, paper title, author. The HTML title almost always carries this. If a canonical name exists, it MUST appear as a tag.
+
+2. CATEGORY — what KIND of thing the page is: icon-library, web-framework, cli-tool, tutorial, documentation, paper, video-essay, landing-page, blog-post, course, dataset, etc.
+
+3. TECHNOLOGY / TOPIC — only technologies, languages, frameworks, methods, or domains that are INTRINSIC to the subject: what it is written in, what it primarily targets, what domain it operates in, what topic it teaches.
+
+   Apply this test before tagging any technology: "If this technology were removed, would this still be the same project / video / article?" If yes, it is INCIDENTAL — skip it.
+
+   INTRINSIC (tag these): the language a library is written in (node.js, typescript, rust); the format it produces (svg, json, pdf); the framework it extends (react, django); the domain it teaches or implements (machine-learning, cryptography, ray-tracing).
+
+   INCIDENTAL — DO NOT tag these even when mentioned prominently:
+   - build / compile / packaging tools used only to ship the subject: docker, make, cmake, gcc, webpack, vite, rollup, esbuild
+   - CI / release / hosting infrastructure: github-actions, ci, cd, vercel, netlify, heroku
+   - operating systems or environments the subject happens to run on: linux, windows, macos, wsl, android, ios — UNLESS the subject is OS-specific (e.g., a Windows-only tool)
+   - shells, terminals, editors used in demos: bash, zsh, powershell, vscode, vim
+   - package managers used purely for distribution: npm, pip, cargo, brew, apt — UNLESS the package manager itself is the subject
+   - cross-compilation targets mentioned as "also builds for X"
+   - languages mentioned only because the docs include a code block in them
+
+DO NOT tag, in general:
+- the hosting platform (github, youtube, npm-website, medium, x, reddit) — that is the host, not the subject
+- terms that come from user comments, reactions, recommended/related items, ads, navigation, or "you might also like" blocks
+- empty generic words: article, blog, website, page, video, content, post, project, library, software
+
+REUSE a tag from the existing list when it already fits the concept; only create a new tag when no existing tag covers it, and match the style of the existing taxonomy.
+
+Format: lowercase kebab-case, 1-3 words per tag joined by hyphens (e.g., react, machine-learning, icon-library). No leading '#'. No spaces inside a tag.
+
+Language: if the existing tag list is non-empty, match its primary language. Otherwise, use the page's primary language.
+
+Output STRICT JSON only, exactly in this shape: {"tags":["tag-one","tag-two"]}. No prose, no markdown fences, no explanation.`
 
 // loadPromptOrDefault returns the contents of the file pointed to by envVar
 // (when set, readable, non-empty, and ≤ maxPromptFileBytes). Otherwise logs a
