@@ -142,6 +142,18 @@ export default function App() {
 					if (Array.isArray(r?.tags))
 						setKnownTags(r.tags as TagCount[]);
 				});
+				// Refresh the visited/indexed counters in the header. The
+				// daemon's ingest worker is async — a short delay lets the
+				// page row land in the DB before /status reads the count.
+				setTimeout(() => {
+					chrome.runtime.sendMessage(
+						{ type: 'popup_status' },
+						(r) => {
+							if (chrome.runtime.lastError) return;
+							if (r && !r.error) setStatus(r as StatusResponse);
+						},
+					);
+				}, 300);
 			} else {
 				flash(msg.error ?? 'Indexing failed', false);
 			}
