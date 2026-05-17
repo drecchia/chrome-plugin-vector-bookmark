@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,6 +195,8 @@ h1{font-size:15px;font-weight:600}
 .filter-title{font-size:11px;font-weight:600;color:#374151;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;display:flex;justify-content:space-between;align-items:baseline}
 .filter-title .v{color:#9ca3af;font-weight:500;text-transform:none;letter-spacing:0;font-size:11px}
 .filter-empty{font-size:12px;color:#9ca3af;font-style:italic}
+.filter-search{width:100%;box-sizing:border-box;padding:7px 12px;margin-bottom:8px;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;outline:none;background:#fff;color:#111}
+.filter-search:focus{border-color:#111}
 .filter-chips{display:flex;flex-wrap:wrap;gap:4px}
 .tag-chip{font-size:11px;padding:2px 8px;border-radius:11px;cursor:pointer;border:1px solid transparent;background:#f3f4f6;color:#374151;user-select:none;line-height:1.5}
 .tag-chip:hover{background:#e5e7eb}
@@ -245,6 +248,7 @@ input[type=range]#conf-slider{width:100%;accent-color:#111}
       <aside class="search-sidebar">
         <div class="filter-group">
           <div class="filter-title">Tags</div>
+          <input id="tag-chips-filter" class="filter-search" type="search" placeholder="Filter tags…" aria-label="Filter tags">
           <div id="tag-chips" class="filter-chips">
             <div class="filter-empty">Run a search to filter by tags</div>
           </div>
@@ -278,6 +282,7 @@ input[type=range]#conf-slider{width:100%;accent-color:#111}
       <aside class="search-sidebar">
         <div class="filter-group" style="margin-bottom:0">
           <div class="filter-title">Tags <span id="tags-count" class="v"></span></div>
+          <input id="tags-list-filter" class="filter-search" type="search" placeholder="Filter tags…" aria-label="Filter tags">
           <div id="tags-list" class="tags-list-scroll"></div>
         </div>
       </aside>
@@ -406,10 +411,17 @@ function buildSearchURL(query){
   return url
 }
 
+var tagChipsFilter=document.getElementById('tag-chips-filter')
 function renderTagChips(){
   var keys=Object.keys(knownTagsForQuery).sort()
   if(!keys.length){
     tagChips.innerHTML='<div class="filter-empty">Run a search to filter by tags</div>'
+    return
+  }
+  var q=(tagChipsFilter&&tagChipsFilter.value||'').trim().toLowerCase()
+  if(q)keys=keys.filter(function(t){return t.toLowerCase().indexOf(q)!==-1})
+  if(!keys.length){
+    tagChips.innerHTML='<div class="filter-empty">No tags match</div>'
     return
   }
   tagChips.innerHTML=keys.map(function(t){
@@ -419,6 +431,7 @@ function renderTagChips(){
     return '<span class="'+cls+'" data-tag="'+esc(t)+'" title="'+title+'">'+esc(t)+'<span class="count">'+knownTagsForQuery[t]+'</span></span>'
   }).join('')
 }
+if(tagChipsFilter)tagChipsFilter.addEventListener('input',renderTagChips)
 
 tagChips.addEventListener('click',function(e){
   var c=e.target.closest('.tag-chip');if(!c)return
@@ -931,26 +944,38 @@ document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click'
 
 // ── tags ──────────────────────────────────────────────────────────────────────
 var tagsList=document.getElementById('tags-list'),tagsPages=document.getElementById('tags-pages'),activeTag=null
+var tagsListFilter=document.getElementById('tags-list-filter')
+var tagsCache=[]
+function paintTagsList(){
+  var q=(tagsListFilter&&tagsListFilter.value||'').trim().toLowerCase()
+  var sorted=tagsCache.slice().sort(function(a,b){return a.tag.localeCompare(b.tag)})
+  if(q)sorted=sorted.filter(function(t){return t.tag.toLowerCase().indexOf(q)!==-1})
+  if(!sorted.length){
+    tagsList.innerHTML='<div class="filter-empty">'+(q?'No tags match':'No tags yet.')+'</div>'
+    return
+  }
+  tagsList.innerHTML=sorted.map(function(t){
+    var on=t.tag===activeTag
+    return '<button class="tag-side'+(on?' active':'')+'" data-tag="'+esc(t.tag)+'">'+
+      '<span>'+esc(t.tag)+'</span><span class="count">'+t.count+'</span></button>'
+  }).join('')
+}
 function tagsRender(){
   fetch('/tags').then(function(r){return r.json()}).then(function(d){
-    var tags=d.tags||[]
+    tagsCache=d.tags||[]
     var tagsCountEl=document.getElementById('tags-count')
-    if(tagsCountEl)tagsCountEl.textContent=tags.length?'('+tags.length+')':''
-    if(!tags.length){
+    if(tagsCountEl)tagsCountEl.textContent=tagsCache.length?'('+tagsCache.length+')':''
+    if(!tagsCache.length){
       tagsList.innerHTML='<div class="filter-empty">No tags yet.</div>'
       tagsPages.innerHTML='<div class="empty" style="padding:40px 0">No tags yet — open the popup, click <b>Index this site now</b> and fill the <b>Tags</b> field before <b>Confirm</b>.</div>'
       return
     }
-    var sorted=tags.slice().sort(function(a,b){return a.tag.localeCompare(b.tag)})
-    tagsList.innerHTML=sorted.map(function(t){
-      var on=t.tag===activeTag
-      return '<button class="tag-side'+(on?' active':'')+'" data-tag="'+esc(t.tag)+'">'+
-        '<span>'+esc(t.tag)+'</span><span class="count">'+t.count+'</span></button>'
-    }).join('')
+    paintTagsList()
     if(activeTag)tagsLoadPages(activeTag)
-    else renderTagCloud(tags)
+    else renderTagCloud(tagsCache)
   }).catch(function(){tagsList.innerHTML='<div class="filter-empty">Failed to load tags</div>'})
 }
+if(tagsListFilter)tagsListFilter.addEventListener('input',paintTagsList)
 
 // renderTagCloud shows a font-size-weighted cloud of all tags as the default
 // view of the Tags tab when no tag is selected. Click on a word selects it.
@@ -1911,8 +1936,13 @@ func authMiddleware(token string, extraOrigins []string) func(http.Handler) http
 
 			origin := r.Header.Get("Origin")
 			if origin != "" && !strings.HasPrefix(origin, "chrome-extension://") && !allowed[origin] {
-				http.Error(w, `{"error":"forbidden origin"}`, http.StatusUnauthorized)
-				return
+				// Same-origin requests (browsers send Origin on non-GET even
+				// when same-origin) must not be blocked — the UI served by this
+				// daemon issues DELETE/PUT to itself for edit/forget.
+				if u, err := url.Parse(origin); err != nil || u.Host != r.Host {
+					http.Error(w, `{"error":"forbidden origin"}`, http.StatusUnauthorized)
+					return
+				}
 			}
 
 			if r.Header.Get("Authorization") == expected {
@@ -1942,7 +1972,7 @@ func corsMiddleware(extraOrigins []string) func(http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if strings.HasPrefix(origin, "chrome-extension://") || allowed[origin] {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			}
 			if r.Method == http.MethodOptions {
