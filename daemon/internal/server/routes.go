@@ -237,6 +237,7 @@ input[type=range]#conf-slider{width:100%;accent-color:#111}
     <button class="tab" data-panel="hotwords-panel">Hot Words</button>
     <button class="tab" data-panel="hist-panel">Timeline</button>
     <button class="tab" data-panel="blacklist-panel">Exclusions</button>
+    <button class="tab" data-panel="manage-panel">Manage</button>
   </div>
 
   <div id="search-panel" class="panel active">
@@ -331,6 +332,29 @@ input[type=range]#conf-slider{width:100%;accent-color:#111}
     </div>
     <div id="ht-chart"></div>
     <div id="ht-results"></div>
+  </div>
+
+  <div id="manage-panel" class="panel">
+    <div style="max-width:680px">
+      <div style="font-size:13px;font-weight:600;color:#111;margin-bottom:6px">Merge duplicate tags</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:12px">Tags drift over time (<code>ml</code>, <code>machine-learning</code>, <code>machine learning</code>). Let the LLM find near-duplicates, review each, then merge the variants into one canonical tag across every page.</div>
+      <button id="mg-scan" style="padding:8px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;background:#111;color:#fff">Scan for duplicate tags</button>
+      <div id="mg-status" style="font-size:12px;color:#6b7280;margin-top:10px"></div>
+      <div id="mg-groups" style="margin-top:14px;display:flex;flex-direction:column;gap:10px"></div>
+
+      <div style="border-top:1px solid #e5e7eb;margin:22px 0 14px"></div>
+      <div style="font-size:13px;font-weight:600;color:#111;margin-bottom:6px">Manual merge</div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Merge a tag into another by hand, for duplicates the scan misses.</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:13px;color:#374151">Merge</span>
+        <input id="mg-from" list="mg-taglist" type="text" placeholder="source tag" style="flex:1;min-width:140px;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;outline:none;background:#fff">
+        <span style="font-size:13px;color:#374151">into</span>
+        <input id="mg-to" list="mg-taglist" type="text" placeholder="canonical tag" style="flex:1;min-width:140px;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;outline:none;background:#fff">
+        <button id="mg-manual" style="padding:7px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;background:#111;color:#fff">Merge</button>
+      </div>
+      <datalist id="mg-taglist"></datalist>
+      <div id="mg-manual-status" style="font-size:12px;color:#6b7280;margin-top:8px"></div>
+    </div>
   </div>
 </div>
 <script>
@@ -940,6 +964,74 @@ document.getElementById('bl-add').addEventListener('click',function(){
 blInput.addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('bl-add').click()})
 document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
   if(t.dataset.panel==='blacklist-panel')blLoad()
+})})
+
+// ── manage (tag merge) ────────────────────────────────────────────────────────
+var mgStatus=document.getElementById('mg-status'),mgGroups=document.getElementById('mg-groups')
+var mgManualStatus=document.getElementById('mg-manual-status'),mgTaglist=document.getElementById('mg-taglist')
+function mgLoadTaglist(){
+  fetch('/tags').then(function(r){return r.json()}).then(function(d){
+    mgTaglist.innerHTML=(d.tags||[]).map(function(t){return '<option value="'+esc(t.tag)+'">'}).join('')
+  }).catch(function(){})
+}
+// Render one suggested group: canonical <select> (overridable) + variant chips.
+function mgRenderGroup(g){
+  var members=[g.canonical].concat(g.variants||[])
+  var card=document.createElement('div')
+  card.style.cssText='border:1px solid #e5e7eb;border-radius:8px;padding:12px;background:#fafafa'
+  var opts=members.map(function(m){return '<option value="'+esc(m)+'"'+(m===g.canonical?' selected':'')+'>'+esc(m)+'</option>'}).join('')
+  var chips=members.map(function(m){return '<span class="mg-chip" data-tag="'+esc(m)+'" style="display:inline-block;padding:2px 8px;margin:2px;border-radius:10px;background:#eef2ff;color:#4338ca;font-size:12px">'+esc(m)+'</span>'}).join('')
+  card.innerHTML='<div style="font-size:12px;color:#6b7280;margin-bottom:8px">'+members.length+' near-duplicate tags</div>'+
+    '<div style="margin-bottom:10px">'+chips+'</div>'+
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+      '<span style="font-size:13px;color:#374151">Keep as</span>'+
+      '<select class="mg-canon" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff">'+opts+'</select>'+
+      '<button class="mg-approve" style="padding:6px 14px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;background:#111;color:#fff">Approve merge</button>'+
+      '<button class="mg-dismiss" style="padding:6px 14px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;cursor:pointer;background:#fff;color:#374151">Dismiss</button>'+
+      '<span class="mg-msg" style="font-size:12px;color:#6b7280"></span>'+
+    '</div>'
+  var canon=card.querySelector('.mg-canon'),msg=card.querySelector('.mg-msg')
+  card.querySelector('.mg-dismiss').addEventListener('click',function(){card.remove()})
+  card.querySelector('.mg-approve').addEventListener('click',function(){
+    var to=canon.value
+    var from=members.filter(function(m){return m!==to})
+    if(!from.length){msg.textContent='nothing to merge';return}
+    msg.textContent='merging…'
+    fetch('/tags/merge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:from,to:to})})
+      .then(function(r){if(!r.ok)throw 0;return r.json()})
+      .then(function(d){card.style.opacity='0.5';msg.style.color='#059669';msg.textContent='merged into "'+d.tag+'" ('+d.pagesAffected+' pages)';setTimeout(function(){card.remove()},1200);mgLoadTaglist()})
+      .catch(function(){msg.style.color='#dc2626';msg.textContent='merge failed'})
+  })
+  mgGroups.appendChild(card)
+}
+document.getElementById('mg-scan').addEventListener('click',function(){
+  mgGroups.innerHTML='';mgStatus.style.color='#6b7280';mgStatus.textContent='Scanning tags with the LLM…'
+  fetch('/tags/merge/suggest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){
+      if(r.status===503){throw 'LLM not configured — set VBM_EMBED_URL to enable suggestions.'}
+      if(!r.ok){throw 'Scan failed.'}
+      return r.json()
+    })
+    .then(function(d){
+      var groups=d.groups||[]
+      if(!groups.length){mgStatus.textContent='No duplicate tags found.';return}
+      mgStatus.textContent=groups.length+' duplicate group'+(groups.length>1?'s':'')+' found — review and approve below.'
+      groups.forEach(mgRenderGroup)
+    })
+    .catch(function(e){mgStatus.style.color='#dc2626';mgStatus.textContent=(typeof e==='string')?e:'Scan failed.'})
+})
+document.getElementById('mg-manual').addEventListener('click',function(){
+  var from=document.getElementById('mg-from').value.trim(),to=document.getElementById('mg-to').value.trim()
+  if(!from||!to){mgManualStatus.style.color='#dc2626';mgManualStatus.textContent='Both tags are required.';return}
+  if(from===to){mgManualStatus.style.color='#dc2626';mgManualStatus.textContent='Source and target are the same.';return}
+  mgManualStatus.style.color='#6b7280';mgManualStatus.textContent='merging…'
+  fetch('/tags/merge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:[from],to:to})})
+    .then(function(r){if(!r.ok)throw 0;return r.json()})
+    .then(function(d){mgManualStatus.style.color='#059669';mgManualStatus.textContent='Merged "'+from+'" into "'+d.tag+'" ('+d.pagesAffected+' pages).';document.getElementById('mg-from').value='';document.getElementById('mg-to').value='';mgLoadTaglist()})
+    .catch(function(){mgManualStatus.style.color='#dc2626';mgManualStatus.textContent='Merge failed.'})
+})
+document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){
+  if(t.dataset.panel==='manage-panel')mgLoadTaglist()
 })})
 
 // ── tags ──────────────────────────────────────────────────────────────────────
@@ -1858,6 +1950,71 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 			json.NewEncoder(w).Encode(struct {
 				Tags []string `json:"tags"`
 			}{Tags: out})
+		})
+
+		// CR-0007: /tags/merge/suggest — LLM proposes near-duplicate tag clusters.
+		r.Post("/tags/merge/suggest", func(w http.ResponseWriter, req *http.Request) {
+			if llmClient == nil {
+				http.Error(w, `{"error":"LLM not configured"}`, http.StatusServiceUnavailable)
+				return
+			}
+			tags, err := s.ListTags()
+			if err != nil {
+				http.Error(w, `{"error":"list tags failed"}`, http.StatusInternalServerError)
+				return
+			}
+			stats := make([]llm.TagStat, 0, len(tags))
+			for _, t := range tags {
+				stats = append(stats, llm.TagStat{Tag: t.Tag, Count: t.Count})
+			}
+			groups, err := llmClient.SuggestTagMerges(req.Context(), stats)
+			if err != nil {
+				slog.Warn("llm suggest tag merges failed", "err", err)
+				http.Error(w, `{"error":"LLM call failed"}`, http.StatusBadGateway)
+				return
+			}
+			if groups == nil {
+				groups = []llm.MergeGroup{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Groups []llm.MergeGroup `json:"groups"`
+			}{Groups: groups})
+		})
+
+		// CR-0007: /tags/merge — merge `from` tags into `to` across all pages.
+		r.Post("/tags/merge", func(w http.ResponseWriter, req *http.Request) {
+			var body struct {
+				From []string `json:"from"`
+				To   string   `json:"to"`
+			}
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			if strings.TrimSpace(body.To) == "" {
+				http.Error(w, `{"error":"to required"}`, http.StatusBadRequest)
+				return
+			}
+			if len(body.From) == 0 {
+				http.Error(w, `{"error":"from required"}`, http.StatusBadRequest)
+				return
+			}
+			to := store.NormalizeTag(body.To)
+			if to == "" {
+				http.Error(w, `{"error":"invalid target tag"}`, http.StatusBadRequest)
+				return
+			}
+			affected, err := s.MergeTags(body.From, body.To)
+			if err != nil {
+				slog.Warn("merge tags failed", "to", body.To, "err", err)
+				http.Error(w, `{"error":"merge failed"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct {
+				Tag           string `json:"tag"`
+				PagesAffected int    `json:"pagesAffected"`
+			}{Tag: to, PagesAffected: affected})
 		})
 
 		// /tags — list all tags with page counts (feeds popup autocomplete + UI tab).

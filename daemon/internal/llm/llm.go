@@ -95,6 +95,35 @@ Language: if the existing tag list is non-empty, match its primary language. Oth
 
 Output STRICT JSON only, exactly in this shape: {"tags":["tag-one","tag-two"]}. No prose, no markdown fences, no explanation.`
 
+// defaultTagMergePrompt is the system message for SuggestTagMerges. Used when
+// VBM_LLM_PROMPT_TAG_MERGE_FILE is unset or unreadable. CR-0007.
+const defaultTagMergePrompt = `You are cleaning up a tag taxonomy. You receive a list of existing tags, each with the number of pages it is attached to, in the form "tag (count)".
+
+Your job: find groups of tags that are NEAR-DUPLICATES of one another — different spellings of the SAME concept — and propose merging each group into a single canonical tag.
+
+Treat as near-duplicates ONLY:
+- spelling / spacing / punctuation variants: "machine learning" vs "machine-learning" vs "machinelearning"
+- singular / plural: "icon" vs "icons"
+- common abbreviations and their expansion: "ml" vs "machine-learning", "k8s" vs "kubernetes", "js" vs "javascript"
+- obvious synonyms for the exact same thing: "frontend" vs "front-end"
+
+DO NOT merge tags that are merely related or hierarchical but distinct concepts:
+- "react" and "javascript" (one is a framework, the other a language) — KEEP SEPARATE
+- "machine-learning" and "deep-learning" — KEEP SEPARATE
+- "python" and "django" — KEEP SEPARATE
+- a broad topic and a specific instance of it — KEEP SEPARATE
+
+When in doubt, DO NOT merge. A wrong merge destroys information; a missed merge is harmless.
+
+For each group, pick the canonical tag: prefer the variant that is the clearest, most standard spelling (kebab-case, expanded over abbreviated when the expansion is unambiguous), and — as a tiebreaker — the one with the higher page count. The canonical MUST be one of the tags in the group.
+
+Every variant you list MUST appear verbatim in the provided tag list. Do not invent tags.
+
+Output STRICT JSON only, exactly in this shape:
+{"groups":[{"canonical":"machine-learning","variants":["ml","machine learning"]}]}
+
+The "variants" array lists the OTHER tags in the group (excluding the canonical). Omit groups with no variants. If there are no near-duplicates at all, output {"groups":[]}. No prose, no markdown fences, no explanation.`
+
 // loadPromptOrDefault returns the contents of the file pointed to by envVar
 // (when set, readable, non-empty, and ≤ maxPromptFileBytes). Otherwise logs a
 // slog.Warn and returns the embedded fallback. CR-0006.
@@ -134,6 +163,7 @@ type Client struct {
 	http              *http.Client
 	summarizePrompt   string
 	suggestTagsPrompt string
+	tagMergePrompt    string
 	suggestTagsMax    int
 }
 
@@ -161,6 +191,9 @@ func New(embedURL, model, apiKey string) (*Client, error) {
 		),
 		suggestTagsPrompt: loadPromptOrDefault(
 			"VBM_LLM_PROMPT_SUGGEST_TAGS_FILE", defaultPrompt,
+		),
+		tagMergePrompt: loadPromptOrDefault(
+			"VBM_LLM_PROMPT_TAG_MERGE_FILE", defaultTagMergePrompt,
 		),
 		suggestTagsMax: maxTags,
 	}, nil
@@ -395,4 +428,124 @@ func parseTagsJSON(raw string) ([]string, error) {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	return out.Tags, nil
+}
+
+// TagStat is a tag plus its page count, fed to SuggestTagMerges. Defined here to
+// avoid importing the store package (keeps llm dependency-free).
+type TagStat struct {
+	Tag   string
+	Count int
+}
+
+// MergeGroup is one proposed near-duplicate cluster: Canonical is the suggested
+// winner, Variants are the other tags that should be merged into it.
+type MergeGroup struct {
+	Canonical string   `json:"canonical"`
+	Variants  []string `json:"variants"`
+}
+
+// SuggestTagMerges asks the LLM to cluster near-duplicate tags and propose a
+// canonical name per cluster. Retries once on 5xx. The model only sees tag names
+// and counts — never page content. CR-0007.
+func (c *Client) SuggestTagMerges(ctx context.Context, tags []TagStat) ([]MergeGroup, error) {
+	if c == nil {
+		return nil, errors.New("llm client not configured")
+	}
+	if len(tags) == 0 {
+		return []MergeGroup{}, nil
+	}
+
+	lines := make([]string, 0, len(tags))
+	for _, t := range tags {
+		lines = append(lines, fmt.Sprintf("%s (%d)", t.Tag, t.Count))
+	}
+	userMsg := "Tags:\n" + strings.Join(lines, "\n")
+
+	body, err := json.Marshal(map[string]any{
+		"model": c.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": c.tagMergePrompt},
+			{"role": "user", "content": userMsg},
+		},
+		"temperature": 0.1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("transport: %w", err)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("llm endpoint returned %d", resp.StatusCode)
+		}
+		defer resp.Body.Close()
+
+		var result struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+		if len(result.Choices) == 0 {
+			return nil, errors.New("llm response has no choices")
+		}
+		raw := strings.TrimSpace(result.Choices[0].Message.Content)
+		groups, err := parseMergeGroupsJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse merge groups: %w", err)
+		}
+		return groups, nil
+	}
+	return nil, fmt.Errorf("llm call failed after retry: %w", lastErr)
+}
+
+// parseMergeGroupsJSON tolerates markdown fences around the JSON payload and
+// extracts the groups array, dropping groups with no variants.
+func parseMergeGroupsJSON(raw string) ([]MergeGroup, error) {
+	if strings.HasPrefix(raw, "```") {
+		if i := strings.Index(raw, "\n"); i >= 0 {
+			raw = raw[i+1:]
+		}
+		if j := strings.LastIndex(raw, "```"); j >= 0 {
+			raw = raw[:j]
+		}
+		raw = strings.TrimSpace(raw)
+	}
+	var out struct {
+		Groups []MergeGroup `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	groups := make([]MergeGroup, 0, len(out.Groups))
+	for _, g := range out.Groups {
+		if g.Canonical == "" || len(g.Variants) == 0 {
+			continue
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
 }

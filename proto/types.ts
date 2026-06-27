@@ -53,11 +53,7 @@ export interface TagCount {
 // side. CR-0002. `suggest_tags` (CR-0003) extracts but doesn't ingest;
 // payload is forwarded to /tags/suggest via the SW.
 export type ExtractIntent =
-	| 'selection'
-	| 'yt_transcript'
-	| 'yt_comments'
-	| 'suggest_tags'
-	| 'manual';
+	'selection' | 'yt_transcript' | 'yt_comments' | 'suggest_tags' | 'manual';
 
 // ---- Tag suggestion (CR-0003) ----
 export interface SuggestTagsRequest {
@@ -68,6 +64,29 @@ export interface SuggestTagsRequest {
 
 export interface SuggestTagsResponse {
 	tags: string[];
+}
+
+// ---- Tag merge / dedup maintenance (CR-0007) ----
+/** One LLM-proposed near-duplicate cluster. `canonical` is the suggested winner. */
+export interface MergeGroup {
+	canonical: string;
+	variants: string[];
+}
+
+/** POST /tags/merge/suggest response — clusters of near-duplicate tags. */
+export interface SuggestTagMergesResponse {
+	groups: MergeGroup[];
+}
+
+/** POST /tags/merge — rename every `from` tag to `to` across all pages. */
+export interface MergeTagsRequest {
+	from: string[];
+	to: string;
+}
+
+export interface MergeTagsResponse {
+	tag: string;
+	pagesAffected: number;
 }
 
 // ---- Search ----

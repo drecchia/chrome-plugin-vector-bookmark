@@ -1340,6 +1340,69 @@ func (s *Store) UpdatePageTags(rawURL string, tags []string) ([]string, error) {
 	return s.GetPageTags(rawURL)
 }
 
+// MergeTags renames every `from` tag to `to` across all pages, deduplicating
+// against pages that already carry `to` (the (page_id, tag) PK). Returns the
+// number of distinct pages whose tag set changed. `to` and each `from` are
+// normalized; entries that normalize to "" or equal `to` are skipped.
+func (s *Store) MergeTags(from []string, to string) (int, error) {
+	to = normalizeTag(to)
+	if to == "" {
+		return 0, fmt.Errorf("target tag is empty")
+	}
+	// Normalize + dedup sources, dropping the target itself.
+	srcSet := map[string]struct{}{}
+	for _, f := range from {
+		nf := normalizeTag(f)
+		if nf == "" || nf == to {
+			continue
+		}
+		srcSet[nf] = struct{}{}
+	}
+	if len(srcSet) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	affected := map[int64]struct{}{}
+	now := time.Now().UnixMilli()
+	for src := range srcSet {
+		// Collect pages carrying the source tag (for the affected-count).
+		rows, err := tx.Query(`SELECT page_id FROM page_tags WHERE tag = ?`, src)
+		if err != nil {
+			return 0, fmt.Errorf("scan source pages: %w", err)
+		}
+		for rows.Next() {
+			var pid int64
+			if err := rows.Scan(&pid); err != nil {
+				rows.Close()
+				return 0, fmt.Errorf("scan page_id: %w", err)
+			}
+			affected[pid] = struct{}{}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("iterate source pages: %w", err)
+		}
+		// Move rows that don't collide; OR IGNORE skips pages already carrying `to`.
+		if _, err := tx.Exec(`UPDATE OR IGNORE page_tags SET tag = ?, created_at = ? WHERE tag = ?`, to, now, src); err != nil {
+			return 0, fmt.Errorf("update tag: %w", err)
+		}
+		// Remove the collided leftovers the UPDATE skipped.
+		if _, err := tx.Exec(`DELETE FROM page_tags WHERE tag = ?`, src); err != nil {
+			return 0, fmt.Errorf("delete leftover tag: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return len(affected), nil
+}
+
 // GetPageTags returns the tags currently assigned to the page identified by URL.
 // Returns an empty slice (not nil) when the page does not exist.
 func (s *Store) GetPageTags(rawURL string) ([]string, error) {

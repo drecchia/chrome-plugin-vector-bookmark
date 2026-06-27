@@ -478,6 +478,60 @@ func requireTags(t *testing.T, s *Store, url string, want []string) {
 	}
 }
 
+// TestMergeTags_RenamesAcrossPages verifies a variant tag is renamed to the
+// canonical on every page that carries it, and the variant disappears.
+func TestMergeTags_RenamesAcrossPages(t *testing.T) {
+	s := newTestStore(t)
+	u1, u2 := "https://example.com/a", "https://example.com/b"
+	mustIngest(t, s, IngestRequest{URL: u1, Domain: "example.com", Title: "t", Text: longText(120), VisitTs: nowMs(), Tags: []string{"ml"}, SetTags: true})
+	mustIngest(t, s, IngestRequest{URL: u2, Domain: "example.com", Title: "t", Text: longText(120), VisitTs: nowMs(), Tags: []string{"ml", "go"}, SetTags: true})
+
+	n, err := s.MergeTags([]string{"ml", "machine learning"}, "machine-learning")
+	if err != nil {
+		t.Fatalf("MergeTags: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("pagesAffected = %d, want 2", n)
+	}
+	requireTags(t, s, u1, []string{"machine-learning"})
+	requireTags(t, s, u2, []string{"machine-learning", "go"})
+	for _, tc := range mustListTags(t, s) {
+		if tc.Tag == "ml" {
+			t.Errorf("source tag 'ml' still present after merge")
+		}
+	}
+}
+
+// TestMergeTags_DedupOnCollision verifies a page already carrying both the
+// variant and the canonical ends with a single canonical row (PK collision).
+func TestMergeTags_DedupOnCollision(t *testing.T) {
+	s := newTestStore(t)
+	url := "https://example.com/both"
+	mustIngest(t, s, IngestRequest{URL: url, Domain: "example.com", Title: "t", Text: longText(120), VisitTs: nowMs(), Tags: []string{"ml", "machine-learning"}, SetTags: true})
+
+	if _, err := s.MergeTags([]string{"ml"}, "machine-learning"); err != nil {
+		t.Fatalf("MergeTags: %v", err)
+	}
+	requireTags(t, s, url, []string{"machine-learning"})
+}
+
+// TestMergeTags_EmptyTargetRejected guards the empty-target error path.
+func TestMergeTags_EmptyTargetRejected(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.MergeTags([]string{"ml"}, "  "); err == nil {
+		t.Errorf("expected error for empty target tag")
+	}
+}
+
+func mustListTags(t *testing.T, s *Store) []TagCount {
+	t.Helper()
+	tags, err := s.ListTags()
+	if err != nil {
+		t.Fatalf("ListTags: %v", err)
+	}
+	return tags
+}
+
 func contains(ss []string, v string) bool {
 	for _, s := range ss {
 		if s == v {
