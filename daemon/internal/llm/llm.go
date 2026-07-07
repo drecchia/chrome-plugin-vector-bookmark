@@ -281,7 +281,7 @@ func (c *Client) Summarize(ctx context.Context, text string) (string, error) {
 			lastErr = fmt.Errorf("transport: %w", err)
 			continue
 		}
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %d", resp.StatusCode)
 			continue
@@ -369,7 +369,7 @@ func (c *Client) SuggestTags(
 			lastErr = fmt.Errorf("transport: %w", err)
 			continue
 		}
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %d", resp.StatusCode)
 			continue
@@ -488,7 +488,7 @@ func (c *Client) SuggestTagMerges(ctx context.Context, tags []TagStat) ([]MergeG
 			lastErr = fmt.Errorf("transport: %w", err)
 			continue
 		}
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %d", resp.StatusCode)
 			continue

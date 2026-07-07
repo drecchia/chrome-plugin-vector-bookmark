@@ -1355,10 +1355,21 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				SetTags: ir.SetTags,
 				Source:  "indexed",
 			}
-			q.Enqueue(ireq)
-			// P2-02: persist to queue table so pending count is accurate and processed items get cleaned up.
+			// CR-0010: persist to the queue table BEFORE enqueueing so a
+			// 'pending' row exists for the worker to flip to 'failed' on a
+			// definitive embed error (and so a crash between the two still
+			// leaves a recoverable row). Reject with 503 when the in-memory
+			// buffer is full instead of reporting a false success.
 			if err := s.AddQueueItem(ireq); err != nil {
 				slog.Warn("queue persist error", "url", ir.URL, "err", err)
+			}
+			if !q.Enqueue(ireq) {
+				// Buffer full — undo the persisted row so pending count stays honest.
+				if err := s.RemoveQueueItem(ireq.URL); err != nil {
+					slog.Warn("queue rollback error", "url", ir.URL, "err", err)
+				}
+				http.Error(w, `{"error":"ingest queue full"}`, http.StatusServiceUnavailable)
+				return
 			}
 			m.ingestTotal.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -1471,7 +1482,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 		})
 
 		r.Get("/status", func(w http.ResponseWriter, req *http.Request) {
-			visited, indexed, pending, err := s.GetStatus()
+			visited, indexed, pending, failed, err := s.GetStatus()
 			if err != nil {
 				http.Error(w, `{"error":"status failed"}`, http.StatusInternalServerError)
 				return
@@ -1480,6 +1491,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Visited         int    `json:"visited"`
 				Indexed         int    `json:"indexed"`
 				Pending         int    `json:"pending"`
+				Failed          int    `json:"failed"`
 				Version         string `json:"version"`
 				EmbedderVersion string `json:"embedder_version"`
 			}
@@ -1488,6 +1500,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				Visited:         visited,
 				Indexed:         indexed,
 				Pending:         pending,
+				Failed:          failed,
 				Version:         ver,
 				EmbedderVersion: s.EmbedderVersion(),
 			})
@@ -1512,11 +1525,57 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 					tags = []string{}
 				}
 			}
+			// CR-0010: surface the queue state so the popup can distinguish
+			// "still processing" (pending) from "embed failed, retriable"
+			// (failed) instead of assuming the 202 meant done.
+			queueStatus, lastError, _, qerr := s.GetQueueItemStatus(rawURL)
+			if qerr != nil {
+				slog.Warn("queue status lookup error", "url", rawURL, "err", qerr)
+			}
 			json.NewEncoder(w).Encode(struct {
-				Exists  bool     `json:"exists"`
-				Indexed bool     `json:"indexed"`
-				Tags    []string `json:"tags"`
-			}{Exists: exists, Indexed: indexed, Tags: tags})
+				Exists      bool     `json:"exists"`
+				Indexed     bool     `json:"indexed"`
+				Tags        []string `json:"tags"`
+				QueueStatus string   `json:"queueStatus,omitempty"`
+				LastError   string   `json:"lastError,omitempty"`
+			}{Exists: exists, Indexed: indexed, Tags: tags, QueueStatus: queueStatus, LastError: lastError})
+		})
+
+		// POST /queue/retry — re-enqueue a queue row that previously failed its
+		// embed. Body: {url}. CR-0010: gives the popup a manual retry button for
+		// transient OpenRouter failures without re-extracting the page.
+		r.Post("/queue/retry", func(w http.ResponseWriter, req *http.Request) {
+			var body struct {
+				URL string `json:"url"`
+			}
+			if !decodeJSONBody(w, req, &body) {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if strings.TrimSpace(body.URL) == "" {
+				http.Error(w, `{"error":"url required"}`, http.StatusBadRequest)
+				return
+			}
+			ireq, found, err := s.RetryQueueItem(body.URL)
+			if err != nil {
+				http.Error(w, `{"error":"retry failed"}`, http.StatusInternalServerError)
+				return
+			}
+			if !found {
+				http.Error(w, `{"error":"no failed item for url"}`, http.StatusNotFound)
+				return
+			}
+			if !q.Enqueue(ireq) {
+				// Buffer full — put the row back to 'failed' so it stays visible.
+				if err := s.MarkQueueItemFailed(ireq.URL, "ingest queue full", 0); err != nil {
+					slog.Warn("retry rollback error", "url", ireq.URL, "err", err)
+				}
+				http.Error(w, `{"error":"ingest queue full"}`, http.StatusServiceUnavailable)
+				return
+			}
+			m.ingestTotal.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+			w.Write([]byte(`{"retried":true}`))
 		})
 
 		// PUT /page/tags — replace the tag set of an indexed page (set-mode).
@@ -1666,7 +1725,7 @@ func newRouter(s *store.Store, q *queue.Queue, ver string, extraOrigins []string
 				case <-readDone:
 					return
 				case <-statusTicker.C:
-					_, indexed, pending, err := s.GetStatus()
+					_, indexed, pending, _, err := s.GetStatus()
 					if err != nil {
 						return
 					}

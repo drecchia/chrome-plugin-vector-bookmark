@@ -98,14 +98,18 @@ Além desses 4 modos do daemon, o popup oferece **3 intents de extração** (CR-
 - `yt_transcript` — abre o painel de transcript do YouTube e raspa `ytd-transcript-segment-renderer .segment-text`. Visível apenas em `youtube.com/watch`. Erro se o vídeo não tem CC.
 - `yt_comments` — lê os top-50 `ytd-comment-thread-renderer #content-text` já carregados no DOM (sem auto-scroll). Visível apenas em `youtube.com/watch`.
 
-Quando `intent` está presente em `popup_force_index`, o SW força `mode: "manual"` no /ingest porque o texto já vem pronto do content script. Em todos os modos, o badge fica verde após o /ingest retornar 202.
+Quando `intent` está presente em `popup_force_index`, o SW força `mode: "manual"` no /ingest porque o texto já vem pronto do content script.
+
+**Confirmação de indexação (CR-0010):** o `202` do `/ingest` significa apenas "aceito na fila" — o embed roda assíncrono e pode falhar. O SW **não** declara sucesso no 202. Em vez disso: seta badge `indexing` (roxo) e faz `pollIngestOutcome(url)` — poll em `GET /page?url=` (1s→3s, timeout 45s) até `indexed=true` (→ badge verde, broadcast `ingest_complete{ok:true}`, popup atualiza contador imediatamente) ou `queueStatus='failed'` (→ badge `error` laranja, broadcast `{ok:false, error, retriable:true}`, popup mostra banner de erro persistente com botão **Retry**). O Confirm do popup fica desabilitado com spinner "Indexing…" enquanto o ingest está em voo; reabrir o popup durante o processamento restaura o estado via `popup_ingest_state`. Falha **síncrona** do `/ingest` (503 fila cheia, 502 llm_summary) usa badge `error` se o daemon está acessível (probe `/healthz`), `disconnected` só se realmente offline. Retry manual: `popup_retry_ingest` → `POST /queue/retry` re-enfileira a row `failed` sem re-extrair a página.
 
 **Sugestão de tags via LLM (CR-0003):** o input CSV de tags tem um botão ✨ ao lado. Click → `popup_suggest_tags` → SW envia `force_extract` com `intent: 'suggest_tags'` (que extrai mas **não emite `page_viewed`** — devolve payload via `sendResponse`) → SW chama `POST /tags/suggest` → daemon roda `internal/llm.SuggestTags` recebendo a lista de tags existentes como contexto e devolve até 3 tags → popup faz merge dedup-ado no input. Não toca badge nem ingest.
 
 ### Badge state machine (service-worker.ts)
-Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
+Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexing(4) < error(5) < indexed(6)`
 
 `setBadge` nunca faz downgrade de um estado para prioridade menor. O estado é resetado em cada nova navegação (`onUpdated status=loading`). Isso evita que `dwell_started` sobreescreva um badge `visited` em revisitas.
+
+`indexing` (roxo) e `error` (laranja) são os estados de ingest manual (CR-0010): `indexing` acima de `visited` (um ingest em voo supera uma visita simples), `error` acima de `indexing` (o desfecho de falha vence o estado transitório), `indexed` no topo como desfecho de sucesso. Transições que precisam **rebaixar** o badge deterministicamente (ex.: `error`→`indexing` num retry, `indexed`→`indexing` num re-index) passam `setBadge(tabId, state, {force:true})` para furar o guard de prioridade. `updateTabBadge` (troca de aba / navegação) também reflete `queueStatus` do `/page`: `failed`→`error`, `pending`→`indexing`.
 
 ### Daemon (Go)
 - `cmd/vbmd/main.go` — entrypoint, modo `server`
@@ -153,7 +157,8 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 3. **Dedup de conteúdo**: `sha1(normalize(text))` — chunks com mesmo hash são descartados (`INSERT OR IGNORE`).
 4. **Dedup de página**: `sha1(url)` como `url_hash UNIQUE` — revisitas atualizam a página existente.
 5. **Chunking**: janela 512 tokens, overlap 64, mínimo 40 tokens. Texto < 200 chars descartado no content script.
-6. **Queue com backpressure**: canal cap 256. Se cheio, ingest descartado com log.
+6. **Queue com backpressure**: canal cap 256. Se cheio, `/ingest` responde `503 {"error":"ingest queue full"}` (CR-0010 — antes descartava silenciosamente com falso `202`) e a queue row persistida é revertida. `Queue.Enqueue` retorna `bool` (false = cheio).
+6b. **Retry de embed + estado `failed` (CR-0010)**: o `embedWorker` retenta cada request 3x com backoff (1s/4s/10s) antes de desistir. Falha definitiva marca a queue row como `status='failed'` (com `last_error`/`attempts`) em vez de deixá-la `pending` eterno. Rows `failed` **não** são re-enfileiradas no boot (só `pending` são, via `LoadPendingItems`) — só voltam via `POST /queue/retry`. `AddQueueItem` limpa qualquer row anterior da mesma URL (evita `failed` órfã após re-ingest). O cliente LLM (`Summarize`/`SuggestTags`) retenta 429 além de 5xx.
 7. **Busca híbrida RRF**: BM25 via FTS5 + cosine brute-force → RRF k=60. Limite: 20 default, 1000 max (clampado, mínimo 1). UI da aba Search expõe input numérico "Max results". Filtro opcional `?tag=…` restringe candidatos via `page_tags`.
 8. **Modos de ingest**: `full_text` (Readability + meta) | `llm_summary` (resumo via LLM substitui o texto antes do chunking) | `manual` (texto fornecido pelo popup) | `meta_only` (apenas título + meta tags). Default = `full_text`. Em todos os modos, meta + título são prefixados ao corpo, exceto `meta_only` que é apenas o bloco de meta.
 9. **Tags em set-mode**: quando o popup envia ingest com `setTags=true`, a lista de tags vira o estado final daquela página (DELETE + INSERT na mesma tx). `setTags=false`/ausente = merge (INSERT OR IGNORE). Tags são normalizadas para `[a-z0-9 \-_]`, max 64 chars.
@@ -165,12 +170,12 @@ Estados: `tracking(0) < disconnected(1) < blocked(2) < visited(3) < indexed(4)`
 pages       id, url, url_hash (UNIQUE), title, domain, visit_ts (ms), dwell_ms, model_ver, indexed, meta_json, created_at
 chunks      id, page_id (FK→pages CASCADE), chunk_idx, text, text_hash, embedding (BLOB f32), model_ver
 chunks_fts  virtual FTS5 sobre chunks.text (porter stemmer)
-queue       id, url, title, text, visit_ts, dwell_ms, domain, status, created_at, updated_at
+queue       id, url, title, text, visit_ts, dwell_ms, domain, status('pending'|'failed'), created_at, updated_at, tags_json, set_tags, attempts, last_error (V9/CR-0010)
 blacklist   pattern (PRIMARY KEY), created_at
 page_tags   page_id (FK→pages CASCADE), tag, created_at — PK (page_id, tag); index em tag
 ```
 
-Migrações vivem em `internal/store/sqlite.go` (slice `migrations`, gravadas em `schema_versions`). Esquema atual está em V7. Sempre adicionar nova migração em vez de editar uma existente.
+Migrações vivem em `internal/store/sqlite.go` (slice `migrations`, gravadas em `schema_versions`). Esquema atual está em **V9** (V8 = coluna `source` em `pages`; V9/CR-0010 = colunas `tags_json`/`set_tags`/`attempts`/`last_error` em `queue`). Sempre adicionar nova migração em vez de editar uma existente.
 
 ## O que nunca fazer
 

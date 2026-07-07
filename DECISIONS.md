@@ -138,3 +138,40 @@ listas legíveis; modelos modernos lidam bem com markdown na system message.
 **Trade-off:** sem reload em runtime — decisão consciente. Reload exigiria
 file-watch ou SIGHUP, complicação desproporcional pra POC. Restart do daemon é
 ~50ms.
+
+---
+
+## D-008 — Feedback de indexação é confirmado por poll, não pelo `202` (CR-0010)
+
+**O quê:** o sucesso de uma indexação manual (badge verde, toast "Indexed ✓",
+incremento do contador) só é reportado **depois** que o service worker confirma,
+via poll em `GET /page?url=`, que a página realmente foi escrita (`indexed=true`)
+— não quando o `POST /ingest` responde `202`. O `202` passou a significar apenas
+"aceito na fila". Estados intermediários explícitos: badge `indexing` (roxo)
+enquanto o SW confirma, `error` (laranja) quando o embed falha em definitivo.
+
+No daemon, uma falha definitiva de embed (após 3 retries com backoff 1s/4s/10s)
+marca a queue row como `status='failed'` com `last_error`, em vez de deixá-la
+`pending` para sempre. A row `failed` é consultável (`GET /page` devolve
+`queueStatus`/`lastError`) e retentável (`POST /queue/retry`). A tabela `queue`
+passou a persistir `tags_json`/`set_tags` para que o requeue no restart não perca
+as tags digitadas pelo usuário.
+
+**Por quê:** o embed roda assíncrono e depende de um provider remoto (OpenRouter)
+que falha de forma transitória (429/5xx). Tratar o `202` como conclusão produzia
+falso-sucesso: badge verde com página não indexada, contador que não incrementa,
+e erros de provider invisíveis sem caminho de retry. Confirmar contra o estado
+real do daemon elimina a classe inteira de bugs.
+
+**Por que poll e não o WebSocket existente:** o daemon já expõe um WS de status
+(`/ws`), mas ele carrega apenas contadores agregados (`indexed`/`pending`), não o
+desfecho por-URL. Poll simples em `/page?url=` (1s→3s, timeout 45s) mantém o SW
+como único consumidor, sem estender o protocolo WS nem manter conexão viva por
+ingest. Para um daemon local, o custo do poll é irrelevante.
+
+**Trade-off:** o retry de embed segura o slot do worker durante o backoff (até
+~15s). Aceitável: 4 workers, daemon local. O poll do SW depende do SW MV3 ficar
+vivo durante o processamento — o próprio poll (setTimeout recorrente) segura o
+SW acordado; se o Chrome ainda assim suspender, o estado real sobrevive na coluna
+`queue.status` e é reidratado quando o popup reabre (via `queueStatus` do `/page`)
+ou na próxima navegação (via `updateTabBadge`).

@@ -4,10 +4,16 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/vbm/daemon/internal/chunk"
 	"github.com/vbm/daemon/internal/store"
 )
+
+// embedRetryDelays defines the backoff schedule for a single request's embed
+// attempts (CR-0010). len+1 total attempts: the first is immediate, then one
+// wait per entry. Tuned for transient OpenRouter 429/5xx on a local daemon.
+var embedRetryDelays = []time.Duration{1 * time.Second, 4 * time.Second, 10 * time.Second}
 
 // Queue is a two-stage pipeline:
 //
@@ -65,12 +71,16 @@ func New(s *store.Store, bufSize int) *Queue {
 	return q
 }
 
-// Enqueue adds a request to the inbound buffer. Drops silently if full.
-func (q *Queue) Enqueue(req store.IngestRequest) {
+// Enqueue adds a request to the inbound buffer. Returns false if the buffer is
+// full (the request was NOT accepted) so the caller can surface backpressure
+// instead of reporting a false success. CR-0010.
+func (q *Queue) Enqueue(req store.IngestRequest) bool {
 	select {
 	case q.inbound <- req:
+		return true
 	default:
 		slog.Warn("dropped ingest, buffer full", "url", req.URL)
+		return false
 	}
 }
 
@@ -101,12 +111,39 @@ func (q *Queue) embedWorker() {
 			q.writeCh <- store.PreparedIngest{Req: req, Chunks: nil}
 			continue
 		}
+		prepared, attempts, lastErr := q.embedChunks(e, req, chunks)
+		if lastErr != nil {
+			// CR-0010: definitive failure after all retries. Flip the queue row
+			// to 'failed' with the error so the popup can show it and offer a
+			// manual retry — instead of leaving a 'pending' row only a restart
+			// would ever touch.
+			slog.Error("embed failed after retries", "url", req.URL, "attempts", attempts, "err", lastErr)
+			if err := q.store.MarkQueueItemFailed(req.URL, lastErr.Error(), attempts); err != nil {
+				slog.Warn("mark queue item failed error", "url", req.URL, "err", err)
+			}
+			continue
+		}
+		q.writeCh <- store.PreparedIngest{Req: req, Chunks: prepared}
+	}
+}
+
+// embedChunks embeds every chunk of a request, retrying the whole request on
+// the first embed error using embedRetryDelays. Returns the prepared chunks on
+// success, or the number of attempts made and the last error on failure.
+func (q *Queue) embedChunks(e embedder, req store.IngestRequest, chunks []chunk.Chunk) ([]store.PreparedChunk, int, error) {
+	var lastErr error
+	for attempt := 0; attempt <= len(embedRetryDelays); attempt++ {
+		if attempt > 0 {
+			delay := embedRetryDelays[attempt-1]
+			slog.Warn("retrying embed after error", "url", req.URL, "attempt", attempt, "delay", delay, "err", lastErr)
+			time.Sleep(delay)
+		}
 		prepared := make([]store.PreparedChunk, 0, len(chunks))
 		failed := false
 		for _, c := range chunks {
 			vec, err := e.Embed(c.Text)
 			if err != nil {
-				slog.Error("embed chunk error", "url", req.URL, "chunk", c.Index, "err", err)
+				lastErr = err
 				failed = true
 				break
 			}
@@ -117,12 +154,17 @@ func (q *Queue) embedWorker() {
 				Vec:   vec,
 			})
 		}
-		if failed {
-			// Leave queue row as 'pending' — retried on restart.
-			continue
+		if !failed {
+			return prepared, attempt + 1, nil
 		}
-		q.writeCh <- store.PreparedIngest{Req: req, Chunks: prepared}
 	}
+	return nil, len(embedRetryDelays) + 1, lastErr
+}
+
+// embedder is the subset of embed.Embedder the queue needs — declared locally
+// to avoid importing the embed package just for the parameter type.
+type embedder interface {
+	Embed(text string) ([]float32, error)
 }
 
 func (q *Queue) writer() {

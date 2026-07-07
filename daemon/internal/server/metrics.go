@@ -19,7 +19,7 @@ type serverMetrics struct {
 
 func (m *serverMetrics) handler(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, indexed, pending, _ := s.GetStatus()
+		_, indexed, pending, _, _ := s.GetStatus()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		fmt.Fprintf(w, "# HELP vbm_ingest_total Total ingest requests accepted into queue\n")
 		fmt.Fprintf(w, "# TYPE vbm_ingest_total counter\n")

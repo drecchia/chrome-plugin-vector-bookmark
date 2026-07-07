@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -168,7 +169,7 @@ func New(dataDir string, e embed.Embedder) (*Store, error) {
 // crashed are recovered this way.
 func (s *Store) LoadPendingItems() ([]IngestRequest, error) {
 	rows, err := s.db.Query(`
-		SELECT url, title, text, visit_ts, dwell_ms, domain
+		SELECT url, title, text, visit_ts, dwell_ms, domain, tags_json, set_tags
 		FROM queue WHERE status = 'pending' ORDER BY id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("load pending: %w", err)
@@ -177,9 +178,18 @@ func (s *Store) LoadPendingItems() ([]IngestRequest, error) {
 	var items []IngestRequest
 	for rows.Next() {
 		var r IngestRequest
-		if err := rows.Scan(&r.URL, &r.Title, &r.Text, &r.VisitTs, &r.DwellMs, &r.Domain); err != nil {
+		var tagsJSON string
+		var setTags int
+		if err := rows.Scan(&r.URL, &r.Title, &r.Text, &r.VisitTs, &r.DwellMs, &r.Domain, &tagsJSON, &setTags); err != nil {
 			return nil, fmt.Errorf("scan pending: %w", err)
 		}
+		// CR-0010: restore the popup's tag delta so a restart-recovered ingest
+		// keeps the user's tags. Malformed JSON degrades to no tags, not a crash.
+		if tagsJSON != "" {
+			_ = json.Unmarshal([]byte(tagsJSON), &r.Tags)
+		}
+		r.SetTags = setTags == 1
+		r.Source = "indexed"
 		items = append(items, r)
 	}
 	return items, rows.Err()
@@ -239,6 +249,17 @@ CREATE INDEX IF NOT EXISTS idx_page_tags_tag ON page_tags(tag);`
 	// passive dwell captures ("history") from explicit popup ingests
 	// ("indexed"). Existing rows default to "history".
 	const schemaV8 = `ALTER TABLE pages ADD COLUMN source TEXT NOT NULL DEFAULT 'history';`
+	// schemaV9 (CR-0010): make the queue durable and failure-aware.
+	//  - tags_json/set_tags: preserve the popup's tag delta across a daemon
+	//    restart so re-enqueued items don't silently drop the user's tags.
+	//  - attempts/last_error: track embed retries and surface the final error
+	//    so a failed ingest is visible and retriable instead of a fossilised
+	//    'pending' row.
+	const schemaV9 = `
+ALTER TABLE queue ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE queue ADD COLUMN set_tags INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE queue ADD COLUMN last_error TEXT NOT NULL DEFAULT '';`
 
 	migrations := []struct {
 		version    int
@@ -253,6 +274,7 @@ CREATE INDEX IF NOT EXISTS idx_page_tags_tag ON page_tags(tag);`
 		{6, schemaV6, false},
 		{7, schemaV7, false},
 		{8, schemaV8, false},
+		{9, schemaV9, false},
 	}
 
 	for _, m := range migrations {
@@ -1114,8 +1136,8 @@ func (s *Store) RemoveFromBlacklist(pattern string) error {
 	return err
 }
 
-// GetStatus returns the number of indexed pages and pending queue items.
-func (s *Store) GetStatus() (visited int, indexed int, pending int, err error) {
+// GetStatus returns the number of indexed pages and pending/failed queue items.
+func (s *Store) GetStatus() (visited int, indexed int, pending int, failed int, err error) {
 	row := s.db.QueryRow(`SELECT COUNT(*) FROM pages`)
 	if err = row.Scan(&visited); err != nil {
 		return
@@ -1125,7 +1147,11 @@ func (s *Store) GetStatus() (visited int, indexed int, pending int, err error) {
 		return
 	}
 	row = s.db.QueryRow(`SELECT COUNT(*) FROM queue WHERE status = 'pending'`)
-	err = row.Scan(&pending)
+	if err = row.Scan(&pending); err != nil {
+		return
+	}
+	row = s.db.QueryRow(`SELECT COUNT(*) FROM queue WHERE status = 'failed'`)
+	err = row.Scan(&failed)
 	return
 }
 
@@ -1155,18 +1181,97 @@ type ExportPage struct {
 // P2-02: makes pending count in GetStatus() accurate and enables cleanup.
 func (s *Store) AddQueueItem(req IngestRequest) error {
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`
-		INSERT INTO queue (url, title, text, visit_ts, dwell_ms, domain, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-	`, req.URL, req.Title, req.Text, req.VisitTs, req.DwellMs, req.Domain, now)
+	// CR-0010: persist the tag delta so a restart-recovered ingest keeps the
+	// user's tags. Marshal never fails for a []string, but tolerate it anyway.
+	tagsJSON, err := json.Marshal(req.Tags)
+	if err != nil {
+		tagsJSON = []byte("[]")
+	}
+	setTags := 0
+	if req.SetTags {
+		setTags = 1
+	}
+	// CR-0010: a re-ingest supersedes any prior row for the same URL — clear a
+	// stale 'failed' row so it doesn't linger after this attempt succeeds.
+	if _, err = s.db.Exec(`DELETE FROM queue WHERE url = ?`, req.URL); err != nil {
+		return fmt.Errorf("clear queue item: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO queue (url, title, text, visit_ts, dwell_ms, domain, status, created_at, tags_json, set_tags)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+	`, req.URL, req.Title, req.Text, req.VisitTs, req.DwellMs, req.Domain, now, string(tagsJSON), setTags)
 	if err != nil {
 		return fmt.Errorf("add queue item: %w", err)
 	}
 	return nil
 }
 
+// MarkQueueItemFailed flips a pending queue row to status='failed', recording
+// the final embed error and the number of attempts made. CR-0010: makes a
+// failed ingest visible (GetQueueItemStatus) and retriable (RetryQueueItem)
+// instead of leaving a fossilised 'pending' row that only a restart retries.
+func (s *Store) MarkQueueItemFailed(url, errMsg string, attempts int) error {
+	_, err := s.db.Exec(`
+		UPDATE queue SET status = 'failed', last_error = ?, attempts = ?, updated_at = ?
+		WHERE url = ? AND status = 'pending'`,
+		errMsg, attempts, time.Now().UnixMilli(), url)
+	if err != nil {
+		return fmt.Errorf("mark queue item failed: %w", err)
+	}
+	return nil
+}
+
+// GetQueueItemStatus returns the current queue status for a URL. When no queue
+// row exists (already processed and removed, or never queued), ok is false —
+// the caller should treat that as "not pending / not failed".
+func (s *Store) GetQueueItemStatus(url string) (status, lastError string, ok bool, err error) {
+	// Prefer 'failed' over 'pending' if somehow both exist for a URL.
+	row := s.db.QueryRow(`
+		SELECT status, last_error FROM queue WHERE url = ?
+		ORDER BY CASE status WHEN 'failed' THEN 0 ELSE 1 END LIMIT 1`, url)
+	err = row.Scan(&status, &lastError)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("get queue status: %w", err)
+	}
+	return status, lastError, true, nil
+}
+
+// RetryQueueItem resets a 'failed' row back to 'pending' so the caller can
+// re-enqueue it. Returns the request to enqueue and found=false when there is
+// no failed row for the URL.
+func (s *Store) RetryQueueItem(url string) (req IngestRequest, found bool, err error) {
+	row := s.db.QueryRow(`
+		SELECT url, title, text, visit_ts, dwell_ms, domain, tags_json, set_tags
+		FROM queue WHERE url = ? AND status = 'failed' LIMIT 1`, url)
+	var tagsJSON string
+	var setTags int
+	err = row.Scan(&req.URL, &req.Title, &req.Text, &req.VisitTs, &req.DwellMs, &req.Domain, &tagsJSON, &setTags)
+	if err == sql.ErrNoRows {
+		return IngestRequest{}, false, nil
+	}
+	if err != nil {
+		return IngestRequest{}, false, fmt.Errorf("retry lookup: %w", err)
+	}
+	if tagsJSON != "" {
+		_ = json.Unmarshal([]byte(tagsJSON), &req.Tags)
+	}
+	req.SetTags = setTags == 1
+	req.Source = "indexed"
+	if _, err = s.db.Exec(`
+		UPDATE queue SET status = 'pending', last_error = '', updated_at = ?
+		WHERE url = ? AND status = 'failed'`, time.Now().UnixMilli(), url); err != nil {
+		return IngestRequest{}, false, fmt.Errorf("retry reset: %w", err)
+	}
+	return req, true, nil
+}
+
 // RemoveQueueItem deletes all pending queue rows for a given URL after successful ingest.
 // P2-02: prevents the queue table from accumulating processed entries indefinitely.
+// CR-0010: only 'pending' rows are removed — a 'failed' row for the same URL
+// survives until the user retries or a later successful ingest of that URL.
 func (s *Store) RemoveQueueItem(url string) error {
 	_, err := s.db.Exec(`DELETE FROM queue WHERE url = ? AND status = 'pending'`, url)
 	if err != nil {

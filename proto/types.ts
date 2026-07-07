@@ -128,6 +128,8 @@ export interface StatusResponse {
 	visited: number;
 	indexed: number;
 	pending: number;
+	/** CR-0010: queue rows whose embed failed after all retries. */
+	failed?: number;
 	version: string;
 	daemonPort: number | null;
 	captureEnabled: boolean;
@@ -154,6 +156,15 @@ export interface PageStatusResponse {
 	indexed: boolean;
 	/** Tags currently assigned to the page (empty if exists=false). */
 	tags?: string[];
+	/**
+	 * CR-0010: state of the page's queue row, if one exists.
+	 * 'pending' = ingest accepted, still embedding; 'failed' = embed failed
+	 * after all retries (retriable via /queue/retry). Absent when there is no
+	 * queue row (already indexed and cleaned up, or never queued).
+	 */
+	queueStatus?: 'pending' | 'failed';
+	/** Populated when queueStatus === 'failed': the final embed error. */
+	lastError?: string;
 }
 
 // ---- Content script → SW signals ----
