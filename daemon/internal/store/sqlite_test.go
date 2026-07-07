@@ -46,7 +46,7 @@ func TestRecordVisit_UpsertsByURLHash(t *testing.T) {
 		}
 	}
 
-	visited, _, _, err := s.GetStatus()
+	visited, _, _, _, err := s.GetStatus()
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestRecordVisit_DifferentURLsAreSeparateRows(t *testing.T) {
 			t.Fatalf("visit %s: %v", u, err)
 		}
 	}
-	visited, _, _, _ := s.GetStatus()
+	visited, _, _, _, _ := s.GetStatus()
 	if visited != 3 {
 		t.Errorf("expected 3 distinct pages, got %d", visited)
 	}
@@ -85,7 +85,7 @@ func TestIngest_TooShortIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	_, indexed, _, _ := s.GetStatus()
+	_, indexed, _, _, _ := s.GetStatus()
 	if indexed != 0 {
 		t.Errorf("short text should not produce an indexed page, got indexed=%d", indexed)
 	}
@@ -100,7 +100,7 @@ func TestIngest_PromotesToIndexed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	_, indexed, _, _ := s.GetStatus()
+	_, indexed, _, _, _ := s.GetStatus()
 	if indexed != 1 {
 		t.Errorf("expected indexed=1, got %d", indexed)
 	}
@@ -396,7 +396,7 @@ func TestForget_ByDomainDeletesAllPagesOnDomain(t *testing.T) {
 	if err := s.Forget(ForgetRequest{Type: "domain", Value: "gone.dev"}); err != nil {
 		t.Fatalf("Forget domain: %v", err)
 	}
-	visited, _, _, _ := s.GetStatus()
+	visited, _, _, _, _ := s.GetStatus()
 	if visited != 1 {
 		t.Errorf("expected 1 page left, got %d", visited)
 	}

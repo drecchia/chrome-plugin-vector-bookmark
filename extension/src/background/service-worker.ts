@@ -9,6 +9,7 @@ import {
 	addToBlacklist,
 	listTags,
 	suggestTags,
+	retryQueueItem,
 } from './daemon-client';
 import type { IngestMode, ExtractIntent } from '../../../proto/types';
 import {
@@ -46,12 +47,16 @@ type BadgeState =
 	| 'blocked'
 	| 'tracking'
 	| 'visited'
+	| 'indexing'
+	| 'error'
 	| 'indexed'
 	| 'disconnected';
 const BADGE_COLORS: Record<BadgeState, string> = {
 	blocked: '#9ca3af', // grey
 	tracking: '#f59e0b', // yellow
 	visited: '#3b82f6', // blue — history recorded, not indexed
+	indexing: '#8b5cf6', // purple — ingest accepted, embedding in progress
+	error: '#f97316', // orange — ingest failed (retriable), daemon still up
 	indexed: '#22c55e', // green
 	disconnected: '#ef4444', // red
 };
@@ -59,16 +64,23 @@ const BADGE_TITLES: Record<BadgeState, string> = {
 	blocked: 'Vector Bookmark: not tracking this site',
 	tracking: 'Vector Bookmark: tracking dwell time…',
 	visited: 'Vector Bookmark: visit recorded',
+	indexing: 'Vector Bookmark: indexing…',
+	error: 'Vector Bookmark: indexing failed — open popup to retry',
 	indexed: 'Vector Bookmark: page indexed',
 	disconnected: 'Vector Bookmark: daemon unreachable',
 };
 // Priority order — higher index wins; dwell_started must not downgrade visited/indexed.
+// CR-0010: indexing sits above visited (an in-flight ingest supersedes a plain
+// visit); error above indexing (the failed outcome wins over the transient
+// in-progress state); indexed stays on top as the terminal success.
 const BADGE_PRIORITY: Record<BadgeState, number> = {
 	tracking: 0,
 	disconnected: 1,
 	blocked: 2,
 	visited: 3,
-	indexed: 4,
+	indexing: 4,
+	error: 5,
+	indexed: 6,
 };
 const tabBadgeState = new Map<number, BadgeState>();
 
@@ -85,7 +97,109 @@ interface PendingIngest {
 }
 const pendingIngest = new Map<number, PendingIngest>();
 
-function setBadge(tabId: number, state: BadgeState | 'clear'): void {
+// CR-0010: URLs with an ingest currently being confirmed (post-202 poll in
+// flight). Lets the popup restore its "Indexing…" state when reopened mid-ingest
+// and prevents two concurrent polls for the same URL. Keyed by clean URL.
+interface InFlightIngest {
+	tabId?: number;
+	timer?: ReturnType<typeof setTimeout>;
+}
+const inFlightIngests = new Map<string, InFlightIngest>();
+
+// Poll cadence for confirming an ingest actually landed. Starts at 1s, grows to
+// a 3s ceiling, gives up after POLL_TIMEOUT_MS (embed via a remote provider can
+// take several seconds per chunk).
+const POLL_START_MS = 1000;
+const POLL_MAX_MS = 3000;
+const POLL_TIMEOUT_MS = 45_000;
+
+// Broadcast the real ingest outcome to the popup (dropped silently if closed —
+// the badge and /page queueStatus carry the state for a reopened popup).
+function broadcastIngestComplete(payload: {
+	ok: boolean;
+	url: string;
+	error?: string;
+	retriable?: boolean;
+}) {
+	chrome.runtime
+		.sendMessage({ type: 'ingest_complete', ...payload })
+		.catch(() => {});
+}
+
+// pollIngestOutcome watches /page for a URL until the ingest resolves: indexed
+// (success), queueStatus='failed' (embed failed after retries), or timeout.
+// CR-0010: replaces the old "202 == indexed" assumption so the badge, toast,
+// and counters only report success when the daemon actually wrote the page.
+function pollIngestOutcome(url: string, tabId: number | undefined): void {
+	const existing = inFlightIngests.get(url);
+	if (existing?.timer) clearTimeout(existing.timer);
+	const startedTs = Date.now();
+	const entry: InFlightIngest = { tabId };
+	inFlightIngests.set(url, entry);
+
+	let delay = POLL_START_MS;
+	const tick = async () => {
+		let status;
+		let fetched = false;
+		try {
+			status = await pageStatus(url);
+			fetched = true;
+			markHealthy();
+		} catch {
+			// Transient fetch failure — keep polling until the timeout.
+			status = undefined;
+		}
+
+		if (status?.indexed) {
+			inFlightIngests.delete(url);
+			if (tabId !== undefined) setBadge(tabId, 'indexed', { force: true });
+			broadcastIngestComplete({ ok: true, url });
+			return;
+		}
+		// Metadata-only success: the queue row is gone (processed) but the page
+		// has no searchable chunks (too-short text / meta_only). A popup ingest
+		// always carries a tag delta, so a removed row means the page + tags
+		// landed — report success instead of waiting out the timeout.
+		if (fetched && status?.exists && !status.queueStatus) {
+			inFlightIngests.delete(url);
+			if (tabId !== undefined) setBadge(tabId, 'indexed', { force: true });
+			broadcastIngestComplete({ ok: true, url });
+			return;
+		}
+		if (status?.queueStatus === 'failed') {
+			inFlightIngests.delete(url);
+			if (tabId !== undefined) setBadge(tabId, 'error', { force: true });
+			broadcastIngestComplete({
+				ok: false,
+				url,
+				error: status.lastError || 'Indexing failed',
+				retriable: true,
+			});
+			return;
+		}
+		if (Date.now() - startedTs >= POLL_TIMEOUT_MS) {
+			inFlightIngests.delete(url);
+			// Leave the badge on 'indexing' — the row may still be pending; the
+			// popup surfaces a soft timeout the user can retry.
+			broadcastIngestComplete({
+				ok: false,
+				url,
+				error: 'Still indexing — taking longer than expected.',
+				retriable: true,
+			});
+			return;
+		}
+		delay = Math.min(delay + 500, POLL_MAX_MS);
+		entry.timer = setTimeout(tick, delay);
+	};
+	entry.timer = setTimeout(tick, delay);
+}
+
+function setBadge(
+	tabId: number,
+	state: BadgeState | 'clear',
+	opts?: { force?: boolean },
+): void {
 	if (state === 'clear') {
 		tabBadgeState.delete(tabId);
 		chrome.action.setBadgeText({ text: '', tabId });
@@ -93,8 +207,12 @@ function setBadge(tabId: number, state: BadgeState | 'clear'): void {
 		return;
 	}
 	// Never downgrade a higher-priority state (e.g. visited → tracking on revisits).
+	// CR-0010: force=true bypasses the guard for deterministic ingest outcomes
+	// (error → indexing on retry, indexed → indexing on re-index) that must apply
+	// even though they lower the priority.
 	const current = tabBadgeState.get(tabId);
-	if (current && BADGE_PRIORITY[current] > BADGE_PRIORITY[state]) return;
+	if (!opts?.force && current && BADGE_PRIORITY[current] > BADGE_PRIORITY[state])
+		return;
 	tabBadgeState.set(tabId, state);
 	chrome.action.setBadgeText({ text: '●', tabId });
 	chrome.action.setBadgeBackgroundColor({
@@ -140,6 +258,16 @@ async function updateTabBadge(tabId: number, url: string): Promise<void> {
 		const status = await pageStatus(url);
 		if (status.indexed) {
 			setBadge(tabId, 'indexed');
+			return;
+		}
+		// CR-0010: reflect an unfinished/failed queue row so switching tabs
+		// during an ingest doesn't drop the indexing/error badge back to visited.
+		if (status.queueStatus === 'failed') {
+			setBadge(tabId, 'error');
+			return;
+		}
+		if (status.queueStatus === 'pending') {
+			setBadge(tabId, 'indexing');
 			return;
 		}
 		if (status.exists) {
@@ -362,20 +490,45 @@ async function handlePageViewed(
 			setTags: pending !== undefined,
 			mode,
 		});
-		if (tabId !== undefined) setBadge(tabId, 'indexed');
-		// Notify the popup if it's listening (popup may be closed — silently dropped).
-		chrome.runtime
-			.sendMessage({ type: 'ingest_complete', ok: true })
-			.catch(() => {});
+		// CR-0010: the 202 only means "accepted into the queue" — the embed
+		// still runs asynchronously and can fail. Show the in-progress state and
+		// poll /page for the real outcome instead of claiming success now.
+		markHealthy();
+		if (tabId !== undefined) setBadge(tabId, 'indexing', { force: true });
+		pollIngestOutcome(cleanUrl, tabId);
 	} catch (e) {
-		if (tabId !== undefined) setBadge(tabId, 'disconnected');
-		chrome.runtime
-			.sendMessage({
-				type: 'ingest_complete',
-				ok: false,
-				error: String((e as Error)?.message ?? e),
-			})
-			.catch(() => {});
+		// Synchronous /ingest failure (e.g. 503 queue full, 502 llm_summary,
+		// network down). Distinguish a reachable-but-rejecting daemon (show the
+		// real error, retriable) from an unreachable one (disconnected badge).
+		const message = String((e as Error)?.message ?? e);
+		const reachable = await isDaemonReachable();
+		if (tabId !== undefined) {
+			setBadge(tabId, reachable ? 'error' : 'disconnected', {
+				force: true,
+			});
+		}
+		broadcastIngestComplete({
+			ok: false,
+			url: cleanUrl,
+			error: message,
+			retriable: reachable,
+		});
+	}
+}
+
+// isDaemonReachable does a fast /healthz probe used on the ingest error path to
+// pick between the 'error' (daemon up, ingest rejected) and 'disconnected'
+// (daemon down) badges. CR-0010.
+async function isDaemonReachable(): Promise<boolean> {
+	try {
+		const base = getDaemonBase(await getDaemonConfig());
+		const resp = await fetch(`${base}/healthz`, {
+			signal: AbortSignal.timeout(2000),
+		});
+		if (resp.ok) markHealthy();
+		return resp.ok;
+	} catch {
+		return false;
 	}
 }
 
@@ -491,6 +644,42 @@ chrome.runtime.onMessage.addListener(
 			listTags()
 				.then((tags) => sendResponse({ tags }))
 				.catch(() => sendResponse({ tags: [] }));
+			return true;
+		}
+
+		// CR-0010: popup asks, on open, whether an ingest for this URL is still
+		// being confirmed so it can restore the "Indexing…" state.
+		if (msg.type === 'popup_ingest_state') {
+			const url = msg.url ? sanitizeUrl(msg.url) : '';
+			sendResponse({ inFlight: url ? inFlightIngests.has(url) : false });
+			return true;
+		}
+
+		// CR-0010: manual retry of a failed ingest. Re-enqueues the failed queue
+		// row on the daemon (no re-extraction needed) and restarts the poll.
+		if (msg.type === 'popup_retry_ingest') {
+			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+				const rawUrl = msg.url ?? tabs[0]?.url;
+				const tabId = tabs[0]?.id;
+				if (!rawUrl) {
+					sendResponse({ ok: false, error: 'No URL to retry' });
+					return;
+				}
+				const url = sanitizeUrl(rawUrl);
+				retryQueueItem(url)
+					.then(() => {
+						if (tabId !== undefined)
+							setBadge(tabId, 'indexing', { force: true });
+						pollIngestOutcome(url, tabId);
+						sendResponse({ ok: true });
+					})
+					.catch((e) =>
+						sendResponse({
+							ok: false,
+							error: String((e as Error)?.message ?? e),
+						}),
+					);
+			});
 			return true;
 		}
 

@@ -430,7 +430,48 @@ ss -tlnp | grep vbmd
 
 Se usar porta diferente de 7532, abrir popup da extensão → seção **Daemon** → atualizar o campo de porta e salvar.
 
-### 8.3 Busca retorna sempre os mesmos resultados
+### 8.3 Indexação falha / badge laranja "indexing failed" (CR-0010)
+
+Quando um ingest manual falha o embed em definitivo (após 3 retries com backoff),
+a queue row fica `status='failed'` e o popup mostra um banner de erro laranja com
+botão **Retry**. O badge da extensão fica laranja.
+
+```bash
+# Ver quantos ingests falharam
+curl -s http://127.0.0.1:7532/status | jq '.failed'
+
+# Ver o último erro de uma URL específica
+curl -s "http://127.0.0.1:7532/page?url=https://exemplo.com/pagina" | jq '{queueStatus,lastError}'
+
+# Inspecionar as rows failed direto no DB
+sqlite3 ~/.local/share/vbm/vbm.db \
+  "SELECT url, attempts, last_error FROM queue WHERE status='failed';"
+```
+
+Causa mais comum: provider de embedding (OpenRouter) retornando 429/5xx —
+`last_error` mostra `upstream 429` ou similar. Fixes:
+
+| Sintoma em `last_error` | Causa | Fix |
+|---|---|---|
+| `upstream 429` | Rate limit do provider | Aguardar e clicar **Retry** no popup |
+| `upstream 5xx` / `transport:` | Provider fora do ar | Verificar `VBM_EMBED_URL`; **Retry** quando voltar |
+| `401`/`403` | API key inválida | Corrigir `VBM_EMBED_API_KEY` e reiniciar o daemon, depois **Retry** |
+
+Retry pela linha de comando (equivalente ao botão do popup):
+
+```bash
+curl -X POST http://127.0.0.1:7532/queue/retry \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://exemplo.com/pagina"}'
+# → 202 {"retried":true}   |  404 se não há row failed pra essa URL
+```
+
+Rows `failed` **não** são retentadas automaticamente no restart do daemon (só as
+`pending` são). Isso é intencional: evita bater de novo num provider que está
+rejeitando. Use o Retry (popup ou `/queue/retry`) quando a causa estiver
+resolvida.
+
+### 8.3b Busca retorna sempre os mesmos resultados
 
 - Se `VBM_EMBED_URL` ausente → busca puramente BM25, scores idênticos em queries curtas. Configurar embedder (§4).
 - Se embeddings presentes mas scores iguais → verificar `model_ver`:

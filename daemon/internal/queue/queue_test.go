@@ -60,7 +60,7 @@ func TestPipeline_DrainsAndWrites(t *testing.T) {
 	q.Close()
 	q.Wait()
 
-	visited, indexed, _, err := s.GetStatus()
+	visited, indexed, _, _, err := s.GetStatus()
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestPipeline_TooShortSkipped(t *testing.T) {
 	})
 	q.Close()
 	q.Wait()
-	_, indexed, _, _ := s.GetStatus()
+	_, indexed, _, _, _ := s.GetStatus()
 	if indexed != 0 {
 		t.Fatalf("expected 0 indexed for short text, got %d", indexed)
 	}

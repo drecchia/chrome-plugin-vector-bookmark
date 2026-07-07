@@ -187,6 +187,19 @@ export async function removeFromBlacklist(pattern: string): Promise<void> {
 	await checkResponse(res);
 }
 
+// CR-0010: re-enqueue a queue row whose embed previously failed. Resolves on
+// 202; throws on 404 (no failed item) or other non-2xx so the caller can flash
+// the error.
+export async function retryQueueItem(url: string): Promise<void> {
+	const cfg = await getDaemonConfig();
+	const res = await fetch(`${getDaemonBase(cfg)}/queue/retry`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', ...authHeader(cfg) },
+		body: JSON.stringify({ url }),
+	});
+	await checkResponse(res);
+}
+
 export async function reindex(): Promise<{ started: boolean }> {
 	const cfg = await getDaemonConfig();
 	const res = await fetch(`${getDaemonBase(cfg)}/admin/reindex`, {

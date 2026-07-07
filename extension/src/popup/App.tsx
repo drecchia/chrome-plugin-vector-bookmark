@@ -62,6 +62,12 @@ export default function App() {
 	const [mode, setMode] = useState<PopupMode>('full_text');
 	const [manualText, setManualText] = useState('');
 	const [suggestLoading, setSuggestLoading] = useState(false);
+	// CR-0010: real ingest lifecycle. 'indexing' = 202 received, SW is polling
+	// the daemon for the actual outcome; 'error' = embed failed (retriable).
+	const [ingestState, setIngestState] = useState<
+		'idle' | 'indexing' | 'error'
+	>('idle');
+	const [ingestError, setIngestError] = useState('');
 
 	useEffect(() => {
 		chrome.storage.local.get(
@@ -110,6 +116,14 @@ export default function App() {
 						if (Array.isArray(res?.tags)) {
 							setTagsCSV((res.tags as string[]).join(', '));
 						}
+						// CR-0010: reopening on a page whose ingest failed shows
+						// the error banner so the user can retry.
+						if (res?.queueStatus === 'failed') {
+							setIngestState('error');
+							setIngestError(
+								(res.lastError as string) || 'Indexing failed',
+							);
+						}
 					},
 				);
 			}
@@ -123,18 +137,21 @@ export default function App() {
 		});
 	}, []);
 
-	// Listen for the SW broadcast that fires after /ingest resolves.
-	// Replaces the transient "Indexing…" toast with the real outcome and
-	// updates page-status state so the UI matches the daemon.
+	// Listen for the SW broadcast that fires after the ingest's real outcome is
+	// known (the SW polls the daemon post-202). CR-0010: this — not the 202 —
+	// is when we report success/failure and refresh counters.
 	useEffect(() => {
 		const listener = (msg: {
 			type?: string;
 			ok?: boolean;
 			error?: string;
+			retriable?: boolean;
 		}) => {
 			if (msg?.type !== 'ingest_complete') return;
 			if (msg.ok) {
-				flash('Indexed');
+				setIngestState('idle');
+				setIngestError('');
+				flash('Indexed ✓');
 				setPageIndexed(true);
 				setPageExists(true);
 				chrome.runtime.sendMessage({ type: 'popup_list_tags' }, (r) => {
@@ -142,25 +159,34 @@ export default function App() {
 					if (Array.isArray(r?.tags))
 						setKnownTags(r.tags as TagCount[]);
 				});
-				// Refresh the visited/indexed counters in the header. The
-				// daemon's ingest worker is async — a short delay lets the
-				// page row land in the DB before /status reads the count.
-				setTimeout(() => {
-					chrome.runtime.sendMessage(
-						{ type: 'popup_status' },
-						(r) => {
-							if (chrome.runtime.lastError) return;
-							if (r && !r.error) setStatus(r as StatusResponse);
-						},
-					);
-				}, 300);
+				// Success is confirmed against the daemon (the page row exists),
+				// so the counters are safe to read immediately — no delay hack.
+				chrome.runtime.sendMessage({ type: 'popup_status' }, (r) => {
+					if (chrome.runtime.lastError) return;
+					if (r && !r.error) setStatus(r as StatusResponse);
+				});
 			} else {
-				flash(msg.error ?? 'Indexing failed', false);
+				// Persistent error banner with a Retry affordance when retriable.
+				setIngestState('error');
+				setIngestError(msg.error ?? 'Indexing failed');
 			}
 		};
 		chrome.runtime.onMessage.addListener(listener);
 		return () => chrome.runtime.onMessage.removeListener(listener);
 	}, []);
+
+	// CR-0010: on open, restore the "Indexing…" state if the SW is still
+	// confirming an ingest for this tab (e.g. the user reopened the popup).
+	useEffect(() => {
+		if (!currentTabUrl) return;
+		chrome.runtime.sendMessage(
+			{ type: 'popup_ingest_state', url: currentTabUrl },
+			(res) => {
+				if (chrome.runtime.lastError) return;
+				if (res?.inFlight) setIngestState('indexing');
+			},
+		);
+	}, [currentTabUrl]);
 
 	function flash(text: string, ok = true) {
 		setMsg({ text, ok });
@@ -242,20 +268,48 @@ export default function App() {
 				payload.manualText = t;
 			}
 		}
+		// Guard against double-submit while an ingest is in flight.
+		if (ingestState === 'indexing') return;
+		setIngestState('indexing');
+		setIngestError('');
 		chrome.runtime.sendMessage(payload, (res) => {
-			if (chrome.runtime.lastError) return;
+			if (chrome.runtime.lastError) {
+				setIngestState('error');
+				setIngestError('Could not reach background');
+				return;
+			}
 			if (res?.ok) {
-				// Extraction succeeded — but /ingest still hasn't been called.
-				// Show a non-expiring "Indexing…" toast; the `ingest_complete`
-				// listener (mounted in useEffect) will replace it with the real
-				// success/error result from the daemon.
-				setMsg({ text: 'Indexing…', ok: true });
+				// Extraction + 202 succeeded — the SW is now polling the daemon
+				// for the real outcome. The persistent "Indexing…" banner stays
+				// until the `ingest_complete` listener resolves it.
 				setPanelOpen(false);
 				setManualText('');
 			} else {
-				flash(res?.error ?? 'Could not index page', false);
+				setIngestState('error');
+				setIngestError(res?.error ?? 'Could not index page');
 			}
 		});
+	}
+
+	function handleRetryIngest() {
+		if (!currentTabUrl) return;
+		setIngestState('indexing');
+		setIngestError('');
+		chrome.runtime.sendMessage(
+			{ type: 'popup_retry_ingest', url: currentTabUrl },
+			(res) => {
+				if (chrome.runtime.lastError) {
+					setIngestState('error');
+					setIngestError('Could not reach background');
+					return;
+				}
+				if (!res?.ok) {
+					setIngestState('error');
+					setIngestError(res?.error ?? 'Retry failed');
+				}
+				// On ok: SW restarted the poll; ingest_complete will resolve it.
+			},
+		);
 	}
 
 	function handleIgnoreDomain() {
@@ -434,6 +488,16 @@ export default function App() {
 			cursor: 'pointer',
 			textAlign: 'center' as const,
 		},
+		spinner: {
+			width: '12px',
+			height: '12px',
+			flexShrink: 0,
+			border: '2px solid #ddd6fe',
+			borderTopColor: '#7c3aed',
+			borderRadius: '50%',
+			display: 'inline-block',
+			animation: 'vbm-spin 0.7s linear infinite',
+		} as React.CSSProperties,
 		label: {
 			fontSize: '11px',
 			fontWeight: 600,
@@ -514,6 +578,7 @@ export default function App() {
 					font-style: italic;
 					opacity: 1;
 				}
+				@keyframes vbm-spin { to { transform: rotate(360deg); } }
 			`}</style>
 			{/* Header */}
 			<div style={s.header}>
@@ -740,6 +805,79 @@ export default function App() {
 			{/* Flash message */}
 			{msg && <div style={s.flashBox(msg.ok)}>{msg.text}</div>}
 
+			{/* CR-0010: persistent ingest lifecycle banner. Stays until the
+			    daemon confirms the real outcome (not the 202). */}
+			{ingestState === 'indexing' && (
+				<div
+					style={{
+						display: 'flex',
+						alignItems: 'center',
+						gap: '8px',
+						fontSize: '12px',
+						color: '#5b21b6',
+						background: '#f5f3ff',
+						border: '1px solid #ddd6fe',
+						borderRadius: '4px',
+						padding: '6px 8px',
+					}}
+				>
+					<span style={s.spinner} />
+					<span>Indexing… confirming with daemon</span>
+				</div>
+			)}
+			{ingestState === 'error' && (
+				<div
+					style={{
+						display: 'flex',
+						flexDirection: 'column',
+						gap: '6px',
+						fontSize: '12px',
+						color: '#9a3412',
+						background: '#fff7ed',
+						border: '1px solid #fed7aa',
+						borderRadius: '4px',
+						padding: '6px 8px',
+					}}
+				>
+					<span>
+						<strong>Indexing failed.</strong> {ingestError}
+					</span>
+					<div style={{ display: 'flex', gap: '6px' }}>
+						<button
+							onClick={handleRetryIngest}
+							style={{
+								fontSize: '11px',
+								padding: '3px 10px',
+								border: 'none',
+								borderRadius: '4px',
+								background: '#ea580c',
+								color: '#fff',
+								cursor: 'pointer',
+							}}
+						>
+							Retry
+						</button>
+						<button
+							onClick={() => {
+								setIngestState('idle');
+								setIngestError('');
+							}}
+							style={{
+								fontSize: '11px',
+								padding: '3px 10px',
+								border: '1px solid #fed7aa',
+								borderRadius: '4px',
+								background: 'transparent',
+								color: '#9a3412',
+								cursor: 'pointer',
+							}}
+						>
+							Dismiss
+						</button>
+					</div>
+				</div>
+			)}
+
 			{/* Index this site — single entry point; click expands the options panel */}
 			<button style={s.indexBtn} onClick={handleToggleIndexPanel}>
 				{panelOpen ? 'Cancel' : 'Index this site now'}
@@ -941,14 +1079,19 @@ export default function App() {
 					<button
 						style={{
 							...s.indexBtn,
-							background: '#111',
+							background: ingestState === 'indexing' ? '#6b7280' : '#111',
 							color: '#fff',
 							border: 'none',
 							fontWeight: 500,
+							cursor:
+								ingestState === 'indexing'
+									? 'default'
+									: 'pointer',
 						}}
 						onClick={handleConfirmIndex}
+						disabled={ingestState === 'indexing'}
 					>
-						Confirm
+						{ingestState === 'indexing' ? 'Indexing…' : 'Confirm'}
 					</button>
 				</div>
 			)}
